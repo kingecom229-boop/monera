@@ -97,7 +97,16 @@ router.post('/register', async (req, res, next) => {
          VALUES ($1, 'Compte MONERA activé avec succès', $2, 'security')`,
         [
           user.id,
-          `Bienvenue ${user.full_name}. Votre identifiant bancaire unique ${user.member_code} et votre RIB-MONERA sont désormais opérationnels.`,
+          `Bienvenue ${user.full_name}. Votre identifiant bancaire unique ${user.member_code}, votre RIB-MONERA et votre messagerie d'assistance sont opérationnels.`,
+        ]
+      );
+
+      await tx.query(
+        `INSERT INTO support_messages (member_id, sender_role, sender_id, content, read_by_member, read_by_admin)
+         VALUES ($1, 'admin', NULL, $2, FALSE, TRUE)`,
+        [
+          user.id,
+          `Bienvenue ${user.full_name} chez MONERA Private Banking. Votre Conseiller dédié est disponible ici pour toute question ou pour vous transmettre vos codes de validation lors de vos virements vers d'autres banques.`,
         ]
       );
 

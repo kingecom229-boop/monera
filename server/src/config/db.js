@@ -10,6 +10,7 @@ import {
   generateLuhnCardNumber,
   generateMemberCode,
   generateMoneraRib,
+  generateTransferSecurityCode,
   computeLoanSchedule,
 } from '../utils/banking.js';
 
@@ -24,7 +25,7 @@ export const DEFAULT_SITE_SETTINGS = {
   bankName: 'MONERA',
   tagline: "L'architecture bancaire de nouvelle génération. Précision, sécurité souveraine et liquidité instantanée.",
   announcementEnabled: true,
-  announcementText: 'MONERA Private & Digital Banking • Réseau interbancaire RIB-MONERA sécurisé 24h/24 • Protection 3D active',
+  announcementText: 'MONERA Private & Digital Banking • Réseau interbancaire RIB-MONERA & SEPA International sécurisé 24h/24',
   supportEmail: 'contact@monera.com',
   supportPhone: '+33 1 86 95 42 00',
   headquarters: '29 Boulevard Haussmann, 75009 Paris • Lomé Financial District',
@@ -173,15 +174,23 @@ export async function initDatabase() {
     CREATE TABLE IF NOT EXISTS transactions (
       id SERIAL PRIMARY KEY,
       reference VARCHAR(36) UNIQUE NOT NULL,
-      type VARCHAR(30) NOT NULL CHECK (type IN ('transfer', 'admin_credit', 'admin_debit', 'loan_disbursement', 'loan_repayment')),
+      type VARCHAR(30) NOT NULL CHECK (type IN ('transfer', 'external_transfer', 'admin_credit', 'admin_debit', 'loan_disbursement', 'loan_repayment')),
       sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
       recipient_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
       sender_snapshot VARCHAR(180) NOT NULL DEFAULT '',
       recipient_snapshot VARCHAR(180) NOT NULL DEFAULT '',
+      external_bank_name VARCHAR(120) NOT NULL DEFAULT '',
+      external_holder_name VARCHAR(120) NOT NULL DEFAULT '',
+      external_iban VARCHAR(64) NOT NULL DEFAULT '',
+      external_bic VARCHAR(24) NOT NULL DEFAULT '',
+      progress_percent INTEGER NOT NULL DEFAULT 100,
+      verification_step INTEGER NOT NULL DEFAULT 3,
+      code_step_1 VARCHAR(24) NOT NULL DEFAULT '',
+      code_step_2 VARCHAR(24) NOT NULL DEFAULT '',
       amount NUMERIC(15, 2) NOT NULL CHECK (amount > 0),
       fee NUMERIC(15, 2) NOT NULL DEFAULT 0.00 CHECK (fee >= 0),
       currency VARCHAR(8) NOT NULL DEFAULT 'EUR',
-      status VARCHAR(30) NOT NULL CHECK (status IN ('pending_approval', 'completed', 'cancel_requested', 'cancelled')),
+      status VARCHAR(30) NOT NULL CHECK (status IN ('pending_approval', 'awaiting_code_1', 'awaiting_code_2', 'completed', 'cancel_requested', 'cancelled')),
       credited_to_recipient BOOLEAN NOT NULL DEFAULT FALSE,
       description TEXT NOT NULL DEFAULT '',
       cancel_reason TEXT NOT NULL DEFAULT '',
@@ -220,6 +229,19 @@ export async function initDatabase() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS support_messages (
+      id SERIAL PRIMARY KEY,
+      member_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      sender_role VARCHAR(20) NOT NULL CHECK (sender_role IN ('member', 'admin')),
+      sender_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      content TEXT NOT NULL,
+      attached_code VARCHAR(32) NOT NULL DEFAULT '',
+      tx_reference VARCHAR(36) NOT NULL DEFAULT '',
+      read_by_member BOOLEAN NOT NULL DEFAULT FALSE,
+      read_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS site_settings (
       key VARCHAR(80) PRIMARY KEY,
       value JSONB NOT NULL,
@@ -243,6 +265,7 @@ export async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_tx_status ON transactions(status);
     CREATE INDEX IF NOT EXISTS idx_loans_user ON loans(user_id);
     CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id);
+    CREATE INDEX IF NOT EXISTS idx_support_member ON support_messages(member_id, created_at);
   `);
 
   for (const [key, val] of Object.entries(DEFAULT_SITE_SETTINGS)) {
@@ -256,11 +279,13 @@ export async function initDatabase() {
   const adminPassword = process.env.ADMIN_INITIAL_PASSWORD || 'pypython10';
   const existingAdmin = await query('SELECT id FROM users WHERE email = $1', [adminEmail]);
 
+  let adminId;
   if (existingAdmin.rowCount === 0) {
     const adminHash = await bcrypt.hash(adminPassword, 12);
-    await query(
+    const insAdmin = await query(
       `INSERT INTO users (member_code, rib, full_name, email, phone, country, password_hash, role, status, balance, card_number, card_expiry, card_cvv)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'admin', 'active', 1000000.00, $8, $9, $10)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'admin', 'active', 1000000.00, $8, $9, $10)
+       RETURNING id`,
       [
         'MNR-000001',
         generateMoneraRib(),
@@ -274,17 +299,20 @@ export async function initDatabase() {
         generateCardCvv(),
       ]
     );
+    adminId = insAdmin.rows[0].id;
+  } else {
+    adminId = existingAdmin.rows[0].id;
   }
 
   const memberCountRes = await query("SELECT COUNT(*)::int AS cnt FROM users WHERE role = 'member'");
   if (memberCountRes.rows[0].cnt === 0) {
-    await seedInitialBankingEcosystem();
+    await seedInitialBankingEcosystem(adminId);
   }
 
   isInitialized = true;
 }
 
-async function seedInitialBankingEcosystem() {
+async function seedInitialBankingEcosystem(adminId) {
   const samplePass = await bcrypt.hash('MoneraClient#2026', 12);
   const seedMembers = [
     {
@@ -349,23 +377,28 @@ async function seedInitialBankingEcosystem() {
   await query(
     `INSERT INTO transactions (reference, type, sender_id, recipient_id, sender_snapshot, recipient_snapshot, amount, status, credited_to_recipient, description)
      VALUES
-     ('TXN-20261020-A81F02', 'transfer', $1, $2, $5, $6, 1250.00, 'completed', TRUE, 'Règlement honoraires conseil international'),
-     ('TXN-20261021-C39D14', 'transfer', $3, $1, $7, $5, 3400.00, 'cancel_requested', TRUE, 'Acompte contrat immobilier Madrid'),
-     ('TXN-20261022-E72B90', 'transfer', $4, $3, $8, $7, 7800.00, 'pending_approval', FALSE, 'Transfert trésorerie inter-filiales')`,
+     ('TXN-20261020-A81F02', 'transfer', $1, $2, $4, $5, 1250.00, 'completed', TRUE, 'Règlement honoraires conseil international'),
+     ('TXN-20261021-C39D14', 'transfer', $3, $1, $6, $4, 3400.00, 'cancel_requested', TRUE, 'Acompte contrat immobilier Madrid')`,
     [
       m1.id,
       m2.id,
       m3.id,
-      m4.id,
       `${m1.full_name} (${m1.member_code})`,
       `${m2.full_name} (${m2.member_code})`,
       `${m3.full_name} (${m3.member_code})`,
-      `${m4.full_name} (${m4.member_code})`,
     ]
   );
 
   await query(
     `UPDATE transactions SET cancel_reason = 'Erreur sur le montant du second appel de fonds — demande de restitution.' WHERE reference = 'TXN-20261021-C39D14'`
+  );
+
+  await query(
+    `INSERT INTO transactions
+      (reference, type, sender_id, recipient_id, sender_snapshot, recipient_snapshot, external_bank_name, external_holder_name, external_iban, external_bic, progress_percent, verification_step, code_step_1, amount, status, credited_to_recipient, description)
+     VALUES
+      ('EXT-20261022-F91C04', 'external_transfer', $1, NULL, $2, 'BNP Paribas • Laurent Holding SAS', 'BNP Paribas', 'Laurent Holding SAS', 'FR76 3000 4008 0500 0107 3829 144', 'BNPAFRPP', 15, 1, $3, 4500.00, 'awaiting_code_1', FALSE, 'Virement interbancaire externe vers BNP Paribas')`,
+    [m4.id, `${m4.full_name} (${m4.member_code})`, generateTransferSecurityCode(1)]
   );
 
   const schedule1 = computeLoanSchedule(25000, 3.85, 36);
@@ -389,8 +422,23 @@ async function seedInitialBankingEcosystem() {
   for (const m of inserted) {
     await query(
       `INSERT INTO notifications (user_id, title, message, category)
-       VALUES ($1, 'Bienvenue chez MONERA Private Banking', 'Votre compte courant international et votre carte virtuelle 3D MONERA sont actifs.', 'security')`,
+       VALUES ($1, 'Bienvenue chez MONERA Private Banking', 'Votre compte courant international, votre messagerie d’assistance dédiée et votre carte virtuelle 3D sont actifs.', 'security')`,
       [m.id]
     );
+    await query(
+      `INSERT INTO support_messages (member_id, sender_role, sender_id, content, read_by_member, read_by_admin)
+       VALUES ($1, 'admin', $2, $3, FALSE, TRUE)`,
+      [
+        m.id,
+        adminId,
+        `Bonjour ${m.full_name}, bienvenue sur votre Messagerie d’Assistance Privée MONERA. Notre équipe est à votre écoute 24h/24 pour toute assistance ou délivrance de codes de sécurité lors de vos virements externes.`,
+      ]
+    );
   }
+
+  await query(
+    `INSERT INTO support_messages (member_id, sender_role, sender_id, content, tx_reference, read_by_member, read_by_admin)
+     VALUES ($1, 'member', $1, 'Bonjour, je viens d’initier un virement externe de 4 500,00 € vers BNP Paribas (réf. EXT-20261022-F91C04) actuellement bloqué à 15%. Pouvez-vous me transmettre le premier code de validation ?', 'EXT-20261022-F91C04', TRUE, FALSE)`,
+    [m4.id]
+  );
 }

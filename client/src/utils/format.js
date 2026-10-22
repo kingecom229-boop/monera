@@ -1,3 +1,32 @@
+export const EXTERNAL_BANKS = [
+  { name: 'BNP Paribas', bic: 'BNPAFRPP' },
+  { name: 'Société Générale', bic: 'SOGEFRPP' },
+  { name: 'Crédit Agricole', bic: 'AGRIFRPP' },
+  { name: 'BoursoBank', bic: 'BOUSFRPP' },
+  { name: 'Crédit Mutuel', bic: 'CMCIFR2A' },
+  { name: 'La Banque Postale', bic: 'PSSTFRPP' },
+  { name: 'LCL', bic: 'CRLYFRPP' },
+  { name: 'BBVA España', bic: 'BBVAESMM' },
+  { name: 'Banco Santander', bic: 'BSCHESMM' },
+  { name: 'Revolut Bank', bic: 'REVOLT21' },
+  { name: 'N26 Bank', bic: 'NTSBDEB1' },
+  { name: 'Ecobank Transnational', bic: 'ECOCFRPP' },
+  { name: 'Orabank', bic: 'ORABTGLL' },
+  { name: 'Bank of Africa (BOA)', bic: 'AFRITGLL' },
+  { name: 'NSIA Banque', bic: 'NSIATGLL' },
+  { name: 'Coris Bank International', bic: 'CORITGLL' },
+  { name: 'United Bank for Africa (UBA)', bic: 'UNAFNGLA' },
+  { name: 'UBS Switzerland', bic: 'UBSWCHZH' },
+  { name: 'Autre établissement bancaire', bic: '' },
+];
+
+export function extractSecurityCode(message) {
+  if (!message) return '';
+  if (message.attachedCode) return message.attachedCode;
+  const match = String(message.content || '').match(/\bMNR[12]-\d{6}\b/i);
+  return match ? match[0].toUpperCase() : '';
+}
+
 export function formatMoney(amount, currency = 'EUR') {
   const num = Number(amount || 0);
   return new Intl.NumberFormat('fr-FR', {
@@ -36,8 +65,18 @@ export function getTxStatusMeta(status) {
   switch (status) {
     case 'completed':
       return {
-        label: 'Effectué',
+        label: 'Effectué (100%)',
         badgeClass: 'bg-emerald-500/12 text-emerald-700 border-emerald-500/25',
+      };
+    case 'awaiting_code_1':
+      return {
+        label: 'Bloqué à 15% • Code 1 requis',
+        badgeClass: 'bg-amber-500/15 text-amber-800 border-amber-500/35',
+      };
+    case 'awaiting_code_2':
+      return {
+        label: 'En cours à 70% • Code 2 requis',
+        badgeClass: 'bg-cyan-500/15 text-[#072146] border-cyan-500/40',
       };
     case 'pending_approval':
       return {

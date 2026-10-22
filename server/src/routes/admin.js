@@ -31,6 +31,20 @@ function serializeAdminTx(row) {
     recipientCode: row.recipient_code || '',
     recipientEmail: row.recipient_email || '',
     recipientRib: row.recipient_rib || '',
+    externalBankName: row.external_bank_name || '',
+    externalHolderName: row.external_holder_name || '',
+    externalIban: row.external_iban || '',
+    externalBic: row.external_bic || '',
+    progressPercent: Number(row.progress_percent ?? 100),
+    verificationStep: Number(row.verification_step ?? 3),
+    codeStep1: row.code_step_1 || '',
+    codeStep2: row.code_step_2 || '',
+    activeRequiredCode:
+      row.status === 'awaiting_code_1'
+        ? row.code_step_1
+        : row.status === 'awaiting_code_2'
+          ? row.code_step_2
+          : '',
     amount: Number(row.amount),
     fee: Number(row.fee || 0),
     currency: row.currency || 'EUR',
@@ -56,9 +70,11 @@ router.get('/overview', async (_req, res, next) => {
         (SELECT COUNT(*)::int FROM transactions) AS total_transactions,
         COALESCE((SELECT SUM(amount)::numeric FROM transactions WHERE status = 'completed'), 0) AS completed_volume,
         (SELECT COUNT(*)::int FROM transactions WHERE status = 'pending_approval') AS pending_transfers,
+        (SELECT COUNT(*)::int FROM transactions WHERE status IN ('awaiting_code_1', 'awaiting_code_2')) AS awaiting_code_transfers,
         (SELECT COUNT(*)::int FROM transactions WHERE status = 'cancel_requested') AS cancel_requests,
         (SELECT COUNT(*)::int FROM loans WHERE status = 'pending') AS pending_loans,
-        COALESCE((SELECT SUM(amount)::numeric FROM loans WHERE status = 'approved'), 0) AS approved_loans_volume
+        COALESCE((SELECT SUM(amount)::numeric FROM loans WHERE status = 'approved'), 0) AS approved_loans_volume,
+        (SELECT COUNT(*)::int FROM support_messages WHERE sender_role = 'member' AND read_by_admin = FALSE) AS unread_support_messages
     `);
 
     const k = kpiRes.rows[0];
@@ -70,9 +86,11 @@ router.get('/overview', async (_req, res, next) => {
         totalTransactions: Number(k.total_transactions),
         completedVolume: Number(k.completed_volume),
         pendingTransfers: Number(k.pending_transfers),
+        awaitingCodeTransfers: Number(k.awaiting_code_transfers),
         cancelRequests: Number(k.cancel_requests),
         pendingLoans: Number(k.pending_loans),
         approvedLoansVolume: Number(k.approved_loans_volume),
+        unreadSupportMessages: Number(k.unread_support_messages),
       },
       settings,
     });
@@ -170,6 +188,16 @@ router.post('/members', async (req, res, next) => {
         [
           user.id,
           `Bienvenue ${user.full_name}. Votre compte ${user.member_code} est opérationnel avec un solde initial de ${initialBalance.toFixed(2)} €.`,
+        ]
+      );
+
+      await tx.query(
+        `INSERT INTO support_messages (member_id, sender_role, sender_id, content, read_by_member, read_by_admin)
+         VALUES ($1, 'admin', $2, $3, FALSE, TRUE)`,
+        [
+          user.id,
+          req.user.id,
+          `Bonjour ${user.full_name}, votre Messagerie d'Assistance MONERA est active. Écrivez-nous ici à tout moment pour vos opérations ou codes de déblocage interbancaires.`,
         ]
       );
 
@@ -465,9 +493,10 @@ router.get('/transactions', async (_req, res, next) => {
       LEFT JOIN users r ON r.id = t.recipient_id
       ORDER BY
         CASE
-          WHEN t.status = 'cancel_requested' THEN 0
-          WHEN t.status = 'pending_approval' THEN 1
-          ELSE 2
+          WHEN t.status IN ('awaiting_code_1', 'awaiting_code_2') THEN 0
+          WHEN t.status = 'cancel_requested' THEN 1
+          WHEN t.status = 'pending_approval' THEN 2
+          ELSE 3
         END,
         t.created_at DESC
       LIMIT 300
@@ -508,7 +537,12 @@ router.post('/transactions/:id/approve', async (req, res, next) => {
 
       const upRes = await tx.query(
         `UPDATE transactions
-         SET status = 'completed', credited_to_recipient = TRUE, admin_note = $1, updated_at = NOW()
+         SET status = 'completed',
+             progress_percent = 100,
+             verification_step = 3,
+             credited_to_recipient = TRUE,
+             admin_note = $1,
+             updated_at = NOW()
          WHERE id = $2
          RETURNING *`,
         [adminNote, txId]
@@ -520,7 +554,7 @@ router.post('/transactions/:id/approve', async (req, res, next) => {
            VALUES ($1, 'Virement validé par la banque', $2, 'transfer')`,
           [
             row.sender_id,
-            `Le virement ${row.reference} de ${Number(row.amount).toFixed(2)} € est définitivement validé.`,
+            `Le virement ${row.reference} de ${Number(row.amount).toFixed(2)} € est définitivement validé à 100%.`,
           ]
         );
       }
@@ -575,8 +609,8 @@ router.post('/transactions/:id/cancel', async (req, res, next) => {
       }
 
       const row = resRow.rows[0];
-      if (row.type !== 'transfer') {
-        const err = new Error('Seuls les transferts entre membres peuvent être révoqués via cette action.');
+      if (row.type !== 'transfer' && row.type !== 'external_transfer') {
+        const err = new Error('Seuls les transferts peuvent être révoqués via cette action.');
         err.statusCode = 400;
         throw err;
       }
@@ -588,7 +622,7 @@ router.post('/transactions/:id/cancel', async (req, res, next) => {
 
       const refundTotal = roundMoney(Number(row.amount) + Number(row.fee || 0));
 
-      if (row.credited_to_recipient && row.recipient_id) {
+      if (row.type === 'transfer' && row.credited_to_recipient && row.recipient_id) {
         await tx.query(
           'UPDATE users SET balance = balance - $1, updated_at = NOW() WHERE id = $2',
           [Number(row.amount), row.recipient_id]
@@ -621,7 +655,7 @@ router.post('/transactions/:id/cancel', async (req, res, next) => {
         );
       }
 
-      if (row.credited_to_recipient && row.recipient_id) {
+      if (row.type === 'transfer' && row.credited_to_recipient && row.recipient_id) {
         await tx.query(
           `INSERT INTO notifications (user_id, title, message, category)
            VALUES ($1, 'Révocation bancaire d’un virement reçu', $2, 'cancel')`,
@@ -651,6 +685,201 @@ router.post('/transactions/:id/cancel', async (req, res, next) => {
     if (err.statusCode) {
       return res.status(err.statusCode).json({ error: err.message });
     }
+    return next(err);
+  }
+});
+
+router.get('/messages/threads', async (_req, res, next) => {
+  try {
+    const membersRes = await query(`
+      SELECT u.id, u.member_code, u.full_name, u.email, u.country, u.balance,
+             (SELECT COUNT(*)::int FROM support_messages sm
+              WHERE sm.member_id = u.id AND sm.sender_role = 'member' AND sm.read_by_admin = FALSE) AS unread_count,
+             (SELECT sm.content FROM support_messages sm
+              WHERE sm.member_id = u.id ORDER BY sm.created_at DESC LIMIT 1) AS last_message,
+             (SELECT sm.created_at FROM support_messages sm
+              WHERE sm.member_id = u.id ORDER BY sm.created_at DESC LIMIT 1) AS last_message_at
+      FROM users u
+      WHERE u.role = 'member'
+      ORDER BY
+        (SELECT COUNT(*) FROM transactions tx WHERE tx.sender_id = u.id AND tx.status IN ('awaiting_code_1', 'awaiting_code_2')) DESC,
+        (SELECT COUNT(*) FROM support_messages sm WHERE sm.member_id = u.id AND sm.sender_role = 'member' AND sm.read_by_admin = FALSE) DESC,
+        COALESCE((SELECT MAX(sm.created_at) FROM support_messages sm WHERE sm.member_id = u.id), u.created_at) DESC
+    `);
+
+    const activeCodesRes = await query(`
+      SELECT id, reference, sender_id, external_bank_name, external_holder_name, external_iban,
+             amount, progress_percent, verification_step, status, code_step_1, code_step_2, created_at
+      FROM transactions
+      WHERE type = 'external_transfer' AND status IN ('awaiting_code_1', 'awaiting_code_2')
+      ORDER BY created_at DESC
+    `);
+
+    const byMember = new Map();
+    for (const tx of activeCodesRes.rows) {
+      if (!byMember.has(tx.sender_id)) byMember.set(tx.sender_id, []);
+      byMember.get(tx.sender_id).push({
+        id: tx.id,
+        reference: tx.reference,
+        bankName: tx.external_bank_name,
+        holderName: tx.external_holder_name,
+        iban: tx.external_iban,
+        amount: Number(tx.amount),
+        progressPercent: Number(tx.progress_percent),
+        verificationStep: Number(tx.verification_step),
+        status: tx.status,
+        activeCode: tx.status === 'awaiting_code_1' ? tx.code_step_1 : tx.code_step_2,
+        codeStep1: tx.code_step_1,
+        codeStep2: tx.code_step_2,
+        createdAt: tx.created_at,
+      });
+    }
+
+    res.json({
+      threads: membersRes.rows.map((m) => ({
+        memberId: m.id,
+        memberCode: m.member_code,
+        fullName: m.full_name,
+        email: m.email,
+        country: m.country,
+        balance: Number(m.balance),
+        unreadCount: Number(m.unread_count || 0),
+        lastMessage: m.last_message || '',
+        lastMessageAt: m.last_message_at,
+        pendingCodeTransfers: byMember.get(m.id) || [],
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/messages/:memberId', async (req, res, next) => {
+  try {
+    const memberId = Number(req.params.memberId);
+    await query(
+      `UPDATE support_messages SET read_by_admin = TRUE
+       WHERE member_id = $1 AND sender_role = 'member' AND read_by_admin = FALSE`,
+      [memberId]
+    );
+    const { rows } = await query(
+      'SELECT * FROM support_messages WHERE member_id = $1 ORDER BY created_at ASC LIMIT 250',
+      [memberId]
+    );
+
+    const pendingRes = await query(
+      `SELECT id, reference, external_bank_name, external_holder_name, external_iban,
+              amount, progress_percent, verification_step, status, code_step_1, code_step_2, created_at
+       FROM transactions
+       WHERE sender_id = $1 AND type = 'external_transfer' AND status IN ('awaiting_code_1', 'awaiting_code_2')
+       ORDER BY created_at DESC`,
+      [memberId]
+    );
+
+    res.json({
+      messages: rows.map((r) => ({
+        id: r.id,
+        memberId: r.member_id,
+        senderRole: r.sender_role,
+        content: r.content,
+        attachedCode: r.attached_code || '',
+        txReference: r.tx_reference || '',
+        readByMember: Boolean(r.read_by_member),
+        readByAdmin: Boolean(r.read_by_admin),
+        createdAt: r.created_at,
+      })),
+      pendingCodeTransfers: pendingRes.rows.map((tx) => ({
+        id: tx.id,
+        reference: tx.reference,
+        bankName: tx.external_bank_name,
+        holderName: tx.external_holder_name,
+        iban: tx.external_iban,
+        amount: Number(tx.amount),
+        progressPercent: Number(tx.progress_percent),
+        verificationStep: Number(tx.verification_step),
+        status: tx.status,
+        activeCode: tx.status === 'awaiting_code_1' ? tx.code_step_1 : tx.code_step_2,
+        codeStep1: tx.code_step_1,
+        codeStep2: tx.code_step_2,
+        createdAt: tx.created_at,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/messages/:memberId', async (req, res, next) => {
+  try {
+    const memberId = Number(req.params.memberId);
+    const schema = z.object({
+      content: z.string().trim().min(1, 'Message requis.').max(2000),
+      attachedCode: z.string().trim().max(32).optional().default(''),
+      txReference: z.string().trim().max(36).optional().default(''),
+    });
+
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0].message });
+    }
+
+    const created = await withTransaction(async (tx) => {
+      const ins = await tx.query(
+        `INSERT INTO support_messages (member_id, sender_role, sender_id, content, attached_code, tx_reference, read_by_member, read_by_admin)
+         VALUES ($1, 'admin', $2, $3, $4, $5, FALSE, TRUE)
+         RETURNING *`,
+        [
+          memberId,
+          req.user.id,
+          parsed.data.content,
+          parsed.data.attachedCode,
+          parsed.data.txReference,
+        ]
+      );
+
+      await tx.query(
+        `INSERT INTO notifications (user_id, title, message, category)
+         VALUES ($1, $2, $3, 'security')`,
+        [
+          memberId,
+          parsed.data.attachedCode
+            ? 'Nouveau code de validation reçu dans votre Messagerie'
+            : 'Nouveau message de votre Assistance MONERA',
+          parsed.data.content.slice(0, 180),
+        ]
+      );
+
+      await logAudit({
+        client: tx,
+        actorId: req.user.id,
+        actorEmail: req.user.email,
+        action: parsed.data.attachedCode ? 'ADMIN_DISPATCHED_TRANSFER_CODE' : 'ADMIN_SENT_SUPPORT_MESSAGE',
+        targetType: 'user',
+        targetId: memberId,
+        ipAddress: req.ip,
+        metadata: {
+          txReference: parsed.data.txReference,
+          hasCode: Boolean(parsed.data.attachedCode),
+        },
+      });
+
+      return ins.rows[0];
+    });
+
+    return res.status(201).json({
+      message: {
+        id: created.id,
+        memberId: created.member_id,
+        senderRole: created.sender_role,
+        content: created.content,
+        attachedCode: created.attached_code || '',
+        txReference: created.tx_reference || '',
+        readByMember: Boolean(created.read_by_member),
+        readByAdmin: Boolean(created.read_by_admin),
+        createdAt: created.created_at,
+      },
+    });
+  } catch (err) {
     return next(err);
   }
 });

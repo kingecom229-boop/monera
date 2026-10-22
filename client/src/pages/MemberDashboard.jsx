@@ -4,6 +4,7 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   Bell,
+  Building2,
   Check,
   CheckCircle2,
   Copy,
@@ -12,6 +13,7 @@ import {
   Eye,
   EyeOff,
   FileText,
+  Headphones,
   History,
   Landmark,
   LayoutDashboard,
@@ -28,8 +30,11 @@ import {
 import { apiRequest } from '../api/client';
 import BrandLogo from '../components/BrandLogo';
 import MoneraVirtualCard3D from '../components/MoneraVirtualCard3D';
+import ExternalTransferConsole from '../components/ExternalTransferConsole';
+import MemberSupportChat from '../components/MemberSupportChat';
 import { useAuth } from '../context/AuthContext';
 import {
+  EXTERNAL_BANKS,
   calculateLoanPreview,
   formatDateTime,
   formatMoney,
@@ -52,12 +57,21 @@ export default function MemberDashboard() {
   const [copiedField, setCopiedField] = useState('');
   const [feedbackBanner, setFeedbackBanner] = useState(null);
 
+  const [transferMode, setTransferMode] = useState('internal');
   const [recipientIdentifier, setRecipientIdentifier] = useState('');
   const [verifiedRecipient, setVerifiedRecipient] = useState(null);
   const [lookupLoading, setLookupLoading] = useState(false);
   const [transferAmount, setTransferAmount] = useState('');
   const [transferDescription, setTransferDescription] = useState('');
   const [transferSubmitting, setTransferSubmitting] = useState(false);
+
+  const [selectedBankOption, setSelectedBankOption] = useState(EXTERNAL_BANKS[0].name);
+  const [customBankName, setCustomBankName] = useState('');
+  const [extHolderName, setExtHolderName] = useState('');
+  const [extIban, setExtIban] = useState('');
+  const [extBic, setExtBic] = useState(EXTERNAL_BANKS[0].bic);
+  const [extAmount, setExtAmount] = useState('');
+  const [extDescription, setExtDescription] = useState('');
 
   const [txFilter, setTxFilter] = useState('all');
   const [cancelTarget, setCancelTarget] = useState(null);
@@ -86,12 +100,9 @@ export default function MemberDashboard() {
       setData(res);
       if (res.account) {
         setUser(res.account);
-        setProfileName(res.account.fullName);
-        setProfilePhone(res.account.phone || '');
-        setProfileCountry(res.account.country || 'France');
       }
     } catch (err) {
-      setFeedbackBanner({ type: 'error', text: err.message });
+      if (!silent) setFeedbackBanner({ type: 'error', text: err.message });
     } finally {
       setLoadingData(false);
       setRefreshing(false);
@@ -100,7 +111,19 @@ export default function MemberDashboard() {
 
   useEffect(() => {
     fetchDashboard();
+    const poll = setInterval(() => {
+      fetchDashboard(true);
+    }, 5000);
+    return () => clearInterval(poll);
   }, [fetchDashboard]);
+
+  useEffect(() => {
+    if (data?.account) {
+      setProfileName((prev) => prev || data.account.fullName);
+      setProfilePhone((prev) => prev || data.account.phone || '');
+      setProfileCountry((prev) => prev || data.account.country || 'France');
+    }
+  }, [data?.account]);
 
   useEffect(() => {
     const q = recipientIdentifier.trim();
@@ -147,7 +170,7 @@ export default function MemberDashboard() {
     }
   };
 
-  const handleTransferSubmit = async (e) => {
+  const handleInternalTransferSubmit = async (e) => {
     e.preventDefault();
     setFeedbackBanner(null);
     setTransferSubmitting(true);
@@ -176,13 +199,53 @@ export default function MemberDashboard() {
             : 'Virement Enregistré • Contrôle Admin en cours',
         subtitle:
           tx.status === 'completed'
-            ? 'Les fonds ont été transférés instantanément via le réseau RIB-MONERA.'
+            ? 'Les fonds ont été transférés instantanément au membre MONERA.'
             : 'Le montant a été sécurisé et sera libéré dès validation par le Back-Office MONERA.',
         amount: tx.amount,
         reference: tx.reference,
         counterparty: tx.recipientName,
         detail: tx.description,
       });
+    } catch (err) {
+      setFeedbackBanner({ type: 'error', text: err.message });
+    } finally {
+      setTransferSubmitting(false);
+    }
+  };
+
+  const handleExternalTransferSubmit = async (e) => {
+    e.preventDefault();
+    setFeedbackBanner(null);
+    const resolvedBankName =
+      selectedBankOption === 'Autre établissement bancaire'
+        ? customBankName.trim()
+        : selectedBankOption;
+
+    if (!resolvedBankName) {
+      setFeedbackBanner({ type: 'error', text: 'Veuillez indiquer le nom de la banque destinataire.' });
+      return;
+    }
+
+    setTransferSubmitting(true);
+    try {
+      await apiRequest('/member/external-transfers', {
+        method: 'POST',
+        body: {
+          bankName: resolvedBankName,
+          holderName: extHolderName.trim(),
+          iban: extIban.trim(),
+          bic: extBic.trim(),
+          amount: Number(extAmount),
+          description: extDescription.trim() || `Virement externe vers ${resolvedBankName}`,
+        },
+      });
+
+      setExtHolderName('');
+      setExtIban('');
+      setExtAmount('');
+      setExtDescription('');
+      await fetchDashboard(true);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       setFeedbackBanner({ type: 'error', text: err.message });
     } finally {
@@ -365,8 +428,16 @@ export default function MemberDashboard() {
   const transactions = data?.transactions || [];
   const loans = data?.loans || [];
   const notifications = data?.notifications || [];
+  const supportMessages = data?.supportMessages || [];
+  const unreadSupportCount = Number(data?.unreadSupportCount || 0);
   const directory = data?.directory || [];
   const unreadCount = notifications.filter((n) => !n.isRead).length;
+
+  const activeExternalTransfers = transactions.filter(
+    (t) =>
+      t.type === 'external_transfer' &&
+      (t.status === 'awaiting_code_1' || t.status === 'awaiting_code_2')
+  );
 
   const annualRate = Number(data?.settings?.loanAnnualRate || siteSettings?.loanAnnualRate || 3.85);
   const maxLoanAmount = Number(data?.settings?.maxLoanAmount || siteSettings?.maxLoanAmount || 250000);
@@ -375,18 +446,42 @@ export default function MemberDashboard() {
   const filteredTransactions = transactions.filter((tx) => {
     if (txFilter === 'outgoing') return tx.direction === 'outgoing';
     if (txFilter === 'incoming') return tx.direction === 'incoming';
+    if (txFilter === 'external') return tx.type === 'external_transfer';
     if (txFilter === 'cancel') return tx.status === 'cancel_requested' || tx.status === 'cancelled';
     return true;
   });
 
   const navItems = [
     { id: 'overview', label: 'Tableau de bord', icon: LayoutDashboard },
-    { id: 'transfer', label: 'Effectuer un virement', icon: Send },
+    {
+      id: 'transfer',
+      label: 'Effectuer un virement',
+      icon: Send,
+      badge: activeExternalTransfers.length,
+    },
+    {
+      id: 'support',
+      label: 'Messagerie d’Assistance',
+      icon: Headphones,
+      badge: unreadSupportCount,
+    },
     { id: 'history', label: 'Historique & Annulations', icon: History },
     { id: 'loans', label: 'Demander un prêt', icon: Landmark },
     { id: 'rib', label: 'Mon RIB & Sécurité', icon: FileText },
     { id: 'notifications', label: 'Notifications', icon: Bell, badge: unreadCount },
   ];
+
+  const handleFinalized3D = (completedTx) => {
+    trigger3DEvent({
+      variant: 'transfer_success',
+      title: 'Virement Externe Finalisé à 100%',
+      subtitle: `Les deux paliers de sécurité ont été validés. Les fonds ont été transmis à ${completedTx.externalBankName}.`,
+      amount: completedTx.amount,
+      reference: completedTx.reference,
+      counterparty: `${completedTx.externalBankName} • ${completedTx.externalHolderName}`,
+      detail: `IBAN destinataire : ${completedTx.externalIban}`,
+    });
+  };
 
   return (
     <div className="min-h-screen bg-[#F4F7FB] flex flex-col lg:flex-row">
@@ -476,11 +571,31 @@ export default function MemberDashboard() {
           <div className="flex items-center gap-2.5">
             <button
               type="button"
+              onClick={() => selectTab('support')}
+              className="relative inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-[#072146] hover:border-[#0284FE]"
+            >
+              <Headphones className="h-3.5 w-3.5 text-[#0284FE]" />
+              <span className="hidden sm:inline">Assistance</span>
+              {unreadSupportCount > 0 && (
+                <span className="rounded-full bg-rose-600 px-1.5 py-0.2 text-[10px] font-extrabold text-white">
+                  {unreadSupportCount}
+                </span>
+              )}
+            </button>
+
+            <button
+              type="button"
               onClick={() => setShowBalance((v) => !v)}
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-[#F4F7FB] px-3 py-1.5 text-xs font-bold text-[#072146] hover:border-[#0284FE]"
             >
-              {showBalance ? <EyeOff className="h-3.5 w-3.5 text-[#0284FE]" /> : <Eye className="h-3.5 w-3.5 text-[#0284FE]" />}
-              <span>{showBalance ? 'Masquer soldes' : 'Afficher soldes'}</span>
+              {showBalance ? (
+                <EyeOff className="h-3.5 w-3.5 text-[#0284FE]" />
+              ) : (
+                <Eye className="h-3.5 w-3.5 text-[#0284FE]" />
+              )}
+              <span className="hidden sm:inline">
+                {showBalance ? 'Masquer soldes' : 'Afficher soldes'}
+              </span>
             </button>
 
             <button
@@ -489,7 +604,7 @@ export default function MemberDashboard() {
               className="inline-flex items-center gap-1.5 rounded-lg bg-[#0284FE] px-3.5 py-2 text-xs font-bold text-white hover:bg-[#072146] transition"
             >
               <Send className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Nouveau virement</span>
+              <span className="hidden sm:inline">Virement</span>
             </button>
 
             <button
@@ -519,362 +634,588 @@ export default function MemberDashboard() {
             </div>
           )}
 
-          {activeTab === 'overview' && (
-            <>
-              <div className="grid xl:grid-cols-12 gap-7 items-start">
-                <div className="xl:col-span-5 rounded-3xl bg-white p-6 shadow-bbva border border-slate-200/70">
-                  <div className="flex items-center justify-between mb-4">
-                    <div>
-                      <span className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#0284FE]">
-                        Carte Virtuelle MONERA
-                      </span>
-                      <h2 className="font-display text-lg font-bold text-[#072146]">
-                        Ma Carte Infinite 3D
-                      </h2>
-                    </div>
-                    <CreditCard className="h-5 w-5 text-[#072146]" />
-                  </div>
-
-                  <MoneraVirtualCard3D
-                    account={account}
-                    showBalance={showBalance}
-                    onToggleBalance={() => setShowBalance((v) => !v)}
-                    onToggleFreeze={handleToggleCardFreeze}
-                    freezing={freezingCard}
+          {(activeTab === 'overview' || activeTab === 'transfer') &&
+            activeExternalTransfers.length > 0 && (
+              <div className="space-y-4">
+                {activeExternalTransfers.map((extTx) => (
+                  <ExternalTransferConsole
+                    key={extTx.id}
+                    transaction={extTx}
+                    supportMessages={supportMessages}
+                    onUpdated={() => fetchDashboard(true)}
+                    onOpenSupport={() => selectTab('support')}
+                    onFinalized3D={handleFinalized3D}
                   />
+                ))}
+              </div>
+            )}
+
+          {activeTab === 'overview' && (
+            <div className="grid xl:grid-cols-12 gap-7 items-start">
+              <div className="xl:col-span-5 rounded-3xl bg-white p-6 shadow-bbva border border-slate-200/70">
+                <div className="flex items-center justify-between mb-4">
+                  <div>
+                    <span className="text-[11px] font-bold uppercase tracking-[0.16em] text-[#0284FE]">
+                      Carte Virtuelle MONERA
+                    </span>
+                    <h2 className="font-display text-lg font-bold text-[#072146]">
+                      Ma Carte Infinite 3D
+                    </h2>
+                  </div>
+                  <CreditCard className="h-5 w-5 text-[#072146]" />
                 </div>
 
-                <div className="xl:col-span-7 space-y-6">
-                  <div className="rounded-3xl bg-gradient-to-br from-[#072146] via-[#092B5A] to-[#04142C] text-white p-6 sm:p-8 shadow-bbva">
-                    <div className="flex flex-wrap items-start justify-between gap-4">
-                      <div>
-                        <span className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-300">
-                          Compte Courant Principal ({account.currency})
-                        </span>
-                        <div className="mt-2 font-mono text-3xl sm:text-4xl font-bold tracking-tight tabular-nums">
-                          {showBalance ? formatMoney(account.balance) : '•••• •••,•• €'}
-                        </div>
-                      </div>
+                <MoneraVirtualCard3D
+                  account={account}
+                  showBalance={showBalance}
+                  onToggleBalance={() => setShowBalance((v) => !v)}
+                  onToggleFreeze={handleToggleCardFreeze}
+                  freezing={freezingCard}
+                />
+              </div>
 
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() => selectTab('transfer')}
-                          className="inline-flex items-center gap-1.5 rounded-xl bg-[#2DCCCD] px-4 py-2.5 text-xs font-extrabold text-[#04142C] hover:bg-white transition"
-                        >
-                          <Send className="h-3.5 w-3.5" />
-                          Envoyer
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => selectTab('loans')}
-                          className="inline-flex items-center gap-1.5 rounded-xl border border-white/20 bg-white/10 px-4 py-2.5 text-xs font-bold text-white hover:bg-white/20 transition"
-                        >
-                          <Landmark className="h-3.5 w-3.5 text-[#F0D384]" />
-                          Demander un prêt
-                        </button>
+              <div className="xl:col-span-7 space-y-6">
+                <div className="rounded-3xl bg-gradient-to-br from-[#072146] via-[#092B5A] to-[#04142C] text-white p-6 sm:p-8 shadow-bbva">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div>
+                      <span className="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-300">
+                        Compte Courant Principal ({account.currency})
+                      </span>
+                      <div className="mt-2 font-mono text-3xl sm:text-4xl font-bold tracking-tight tabular-nums">
+                        {showBalance ? formatMoney(account.balance) : '•••• •••,•• €'}
                       </div>
                     </div>
 
-                    <div className="mt-6 pt-5 border-t border-white/15 grid sm:grid-cols-2 gap-3 text-xs">
-                      <div className="rounded-xl bg-white/[0.06] p-3.5 flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <span className="text-slate-300 block">Identifiant Client MONERA</span>
-                          <span className="font-mono font-bold text-sm text-white">
-                            {account.memberCode}
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => copyValue('code', account.memberCode)}
-                          className="rounded-lg bg-white/10 px-2.5 py-1.5 font-semibold text-cyan-300 hover:bg-white/20 shrink-0"
-                        >
-                          {copiedField === 'code' ? 'Copié ✓' : 'Copier'}
-                        </button>
-                      </div>
-
-                      <div className="rounded-xl bg-white/[0.06] p-3.5 flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <span className="text-slate-300 block">RIB-MONERA Officiel</span>
-                          <span className="font-mono font-bold text-xs text-cyan-200 truncate block">
-                            {account.rib}
-                          </span>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => copyValue('rib', account.rib)}
-                          className="rounded-lg bg-white/10 px-2.5 py-1.5 font-semibold text-cyan-300 hover:bg-white/20 shrink-0"
-                        >
-                          {copiedField === 'rib' ? 'Copié ✓' : 'Copier'}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="grid sm:grid-cols-3 gap-4">
-                    <div className="rounded-2xl bg-white p-5 border border-slate-200/80">
-                      <div className="text-xs font-semibold text-slate-500">Total Reçu</div>
-                      <div className="mt-1.5 font-mono text-xl font-extrabold text-emerald-600 tabular-nums">
-                        {showBalance ? `+${formatMoney(data?.stats?.totalReceived || 0)}` : '•••• €'}
-                      </div>
-                    </div>
-                    <div className="rounded-2xl bg-white p-5 border border-slate-200/80">
-                      <div className="text-xs font-semibold text-slate-500">Total Émis</div>
-                      <div className="mt-1.5 font-mono text-xl font-extrabold text-[#072146] tabular-nums">
-                        {showBalance ? formatMoney(data?.stats?.totalSent || 0) : '•••• €'}
-                      </div>
-                    </div>
-                    <div className="rounded-2xl bg-white p-5 border border-slate-200/80">
-                      <div className="text-xs font-semibold text-slate-500">Crédits Actifs</div>
-                      <div className="mt-1.5 font-mono text-xl font-extrabold text-[#0284FE] tabular-nums">
-                        {data?.stats?.activeLoansCount || 0} dossier(s)
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="rounded-3xl bg-white p-6 border border-slate-200/80">
-                    <div className="flex items-center justify-between mb-4">
-                      <h3 className="font-display text-base font-bold text-[#072146]">
-                        Dernières Opérations
-                      </h3>
+                    <div className="flex flex-wrap gap-2">
                       <button
                         type="button"
-                        onClick={() => selectTab('history')}
-                        className="text-xs font-bold text-[#0284FE] hover:underline"
+                        onClick={() => selectTab('transfer')}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-[#2DCCCD] px-4 py-2.5 text-xs font-extrabold text-[#04142C] hover:bg-white transition"
                       >
-                        Voir tout l’historique →
+                        <Send className="h-3.5 w-3.5" />
+                        Envoyer
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => selectTab('support')}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-white/20 bg-white/10 px-4 py-2.5 text-xs font-bold text-white hover:bg-white/20 transition"
+                      >
+                        <Headphones className="h-3.5 w-3.5 text-cyan-300" />
+                        Assistance
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 pt-5 border-t border-white/15 grid sm:grid-cols-2 gap-3 text-xs">
+                    <div className="rounded-xl bg-white/[0.06] p-3.5 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <span className="text-slate-300 block">Identifiant Client MONERA</span>
+                        <span className="font-mono font-bold text-sm text-white">
+                          {account.memberCode}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => copyValue('code', account.memberCode)}
+                        className="rounded-lg bg-white/10 px-2.5 py-1.5 font-semibold text-cyan-300 hover:bg-white/20 shrink-0"
+                      >
+                        {copiedField === 'code' ? 'Copié ✓' : 'Copier'}
                       </button>
                     </div>
 
-                    {transactions.length === 0 ? (
-                      <p className="text-sm text-slate-500 py-6 text-center">
-                        Aucune opération enregistrée pour le moment.
-                      </p>
-                    ) : (
-                      <div className="divide-y divide-slate-100">
-                        {transactions.slice(0, 5).map((tx) => {
-                          const meta = getTxStatusMeta(tx.status);
-                          const isOut = tx.direction === 'outgoing';
-                          return (
-                            <div
-                              key={tx.id}
-                              className="py-3.5 flex flex-wrap items-center justify-between gap-3"
-                            >
-                              <div className="flex items-center gap-3 min-w-0">
-                                <div
-                                  className={`h-10 w-10 rounded-xl flex items-center justify-center shrink-0 ${
-                                    tx.status === 'cancelled'
-                                      ? 'bg-rose-50 text-rose-600'
-                                      : isOut
-                                        ? 'bg-slate-100 text-[#072146]'
-                                        : 'bg-emerald-50 text-emerald-600'
-                                  }`}
-                                >
-                                  {isOut ? (
-                                    <ArrowUpRight className="h-5 w-5" />
-                                  ) : (
-                                    <ArrowDownLeft className="h-5 w-5" />
-                                  )}
-                                </div>
-                                <div className="min-w-0">
-                                  <div className="text-sm font-bold text-[#072146] truncate">
-                                    {isOut ? `Vers ${tx.recipientName}` : `De ${tx.senderName}`}
-                                  </div>
-                                  <div className="text-xs text-slate-500 truncate">
-                                    {tx.description} • {formatDateTime(tx.createdAt)}
-                                  </div>
-                                </div>
-                              </div>
-
-                              <div className="flex items-center gap-3 ml-auto">
-                                <span
-                                  className={`rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${meta.badgeClass}`}
-                                >
-                                  {meta.label}
-                                </span>
-                                <span
-                                  className={`font-mono text-sm font-extrabold tabular-nums ${
-                                    tx.status === 'cancelled'
-                                      ? 'line-through text-slate-400'
-                                      : isOut
-                                        ? 'text-[#072146]'
-                                        : 'text-emerald-600'
-                                  }`}
-                                >
-                                  {isOut ? '-' : '+'}
-                                  {formatMoney(tx.amount)}
-                                </span>
-                                {tx.canRequestCancel && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setCancelTarget(tx);
-                                      setCancelReason('');
-                                    }}
-                                    className="rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-[11px] font-bold text-rose-700 hover:bg-rose-100"
-                                  >
-                                    Annuler
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
+                    <div className="rounded-xl bg-white/[0.06] p-3.5 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <span className="text-slate-300 block">RIB-MONERA Officiel</span>
+                        <span className="font-mono font-bold text-xs text-cyan-200 truncate block">
+                          {account.rib}
+                        </span>
                       </div>
-                    )}
+                      <button
+                        type="button"
+                        onClick={() => copyValue('rib', account.rib)}
+                        className="rounded-lg bg-white/10 px-2.5 py-1.5 font-semibold text-cyan-300 hover:bg-white/20 shrink-0"
+                      >
+                        {copiedField === 'rib' ? 'Copié ✓' : 'Copier'}
+                      </button>
+                    </div>
                   </div>
                 </div>
+
+                <div className="grid sm:grid-cols-3 gap-4">
+                  <div className="rounded-2xl bg-white p-5 border border-slate-200/80">
+                    <div className="text-xs font-semibold text-slate-500">Total Reçu</div>
+                    <div className="mt-1.5 font-mono text-xl font-extrabold text-emerald-600 tabular-nums">
+                      {showBalance ? `+${formatMoney(data?.stats?.totalReceived || 0)}` : '•••• €'}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl bg-white p-5 border border-slate-200/80">
+                    <div className="text-xs font-semibold text-slate-500">Total Émis</div>
+                    <div className="mt-1.5 font-mono text-xl font-extrabold text-[#072146] tabular-nums">
+                      {showBalance ? formatMoney(data?.stats?.totalSent || 0) : '•••• €'}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl bg-white p-5 border border-slate-200/80">
+                    <div className="text-xs font-semibold text-slate-500">Crédits Actifs</div>
+                    <div className="mt-1.5 font-mono text-xl font-extrabold text-[#0284FE] tabular-nums">
+                      {data?.stats?.activeLoansCount || 0} dossier(s)
+                    </div>
+                  </div>
+                </div>
+
+                <div className="rounded-3xl bg-white p-6 border border-slate-200/80">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-display text-base font-bold text-[#072146]">
+                      Dernières Opérations
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => selectTab('history')}
+                      className="text-xs font-bold text-[#0284FE] hover:underline"
+                    >
+                      Voir tout l’historique →
+                    </button>
+                  </div>
+
+                  {transactions.length === 0 ? (
+                    <p className="text-sm text-slate-500 py-6 text-center">
+                      Aucune opération enregistrée pour le moment.
+                    </p>
+                  ) : (
+                    <div className="divide-y divide-slate-100">
+                      {transactions.slice(0, 5).map((tx) => {
+                        const meta = getTxStatusMeta(tx.status);
+                        const isOut = tx.direction === 'outgoing';
+                        return (
+                          <div
+                            key={tx.id}
+                            className="py-3.5 flex flex-wrap items-center justify-between gap-3"
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <div
+                                className={`h-10 w-10 rounded-xl flex items-center justify-center shrink-0 ${
+                                  tx.status === 'cancelled'
+                                    ? 'bg-rose-50 text-rose-600'
+                                    : isOut
+                                      ? 'bg-slate-100 text-[#072146]'
+                                      : 'bg-emerald-50 text-emerald-600'
+                                }`}
+                              >
+                                {isOut ? (
+                                  <ArrowUpRight className="h-5 w-5" />
+                                ) : (
+                                  <ArrowDownLeft className="h-5 w-5" />
+                                )}
+                              </div>
+                              <div className="min-w-0">
+                                <div className="text-sm font-bold text-[#072146] truncate">
+                                  {isOut ? `Vers ${tx.recipientName}` : `De ${tx.senderName}`}
+                                </div>
+                                <div className="text-xs text-slate-500 truncate">
+                                  {tx.description} • {formatDateTime(tx.createdAt)}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-3 ml-auto">
+                              <span
+                                className={`rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${meta.badgeClass}`}
+                              >
+                                {meta.label}
+                              </span>
+                              <span
+                                className={`font-mono text-sm font-extrabold tabular-nums ${
+                                  tx.status === 'cancelled'
+                                    ? 'line-through text-slate-400'
+                                    : isOut
+                                      ? 'text-[#072146]'
+                                      : 'text-emerald-600'
+                                }`}
+                              >
+                                {isOut ? '-' : '+'}
+                                {formatMoney(tx.amount)}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               </div>
-            </>
+            </div>
           )}
 
           {activeTab === 'transfer' && (
             <div className="grid lg:grid-cols-12 gap-7">
               <div className="lg:col-span-7 rounded-3xl bg-white p-6 sm:p-8 shadow-bbva border border-slate-200/80">
-                <span className="text-xs font-bold uppercase tracking-[0.18em] text-[#0284FE]">
-                  Réseau Interne Haute Vitesse
-                </span>
-                <h2 className="mt-1 font-display text-2xl font-bold text-[#072146]">
-                  Envoyer de l’argent à un membre MONERA
-                </h2>
-                <p className="mt-1 text-sm text-slate-500">
-                  Saisissez le <strong>RIB-MONERA</strong>, l’identifiant{' '}
-                  <code className="font-mono">MNR-XXXXXX</code> ou l’adresse email du bénéficiaire.
-                </p>
-
-                <form onSubmit={handleTransferSubmit} className="mt-6 space-y-5">
-                  <div>
-                    <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
-                      Bénéficiaire (RIB-MONERA, ID Membre ou Email)
-                    </label>
-                    <div className="relative">
-                      <Search className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        required
-                        value={recipientIdentifier}
-                        onChange={(e) => setRecipientIdentifier(e.target.value)}
-                        placeholder="Ex. MNR-482910 ou MNR76 0081... ou email"
-                        className="w-full rounded-xl border border-slate-300 pl-10 pr-4 py-3 text-sm font-mono focus:border-[#0284FE] focus:outline-none focus:ring-2 focus:ring-[#0284FE]/20"
-                      />
-                    </div>
-
-                    {lookupLoading && (
-                      <p className="mt-2 text-xs text-slate-500">Vérification du compte bénéficiaire...</p>
-                    )}
-
-                    {verifiedRecipient && (
-                      <div className="mt-2.5 flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50/80 px-4 py-2.5 text-xs text-emerald-900">
-                        <span className="flex items-center gap-2 font-semibold">
-                          <UserCheck className="h-4 w-4 text-emerald-600 shrink-0" />
-                          Titulaire vérifié : <strong>{verifiedRecipient.fullName}</strong> (
-                          {verifiedRecipient.memberCode} • {verifiedRecipient.country})
-                        </span>
-                      </div>
-                    )}
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-1.5">
-                      <label className="text-xs font-bold uppercase tracking-wider text-[#072146]">
-                        Montant à transférer (EUR)
-                      </label>
-                      <span className="text-xs text-slate-500">
-                        Solde disponible :{' '}
-                        <strong className="font-mono text-[#072146]">
-                          {formatMoney(account.balance)}
-                        </strong>
-                      </span>
-                    </div>
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="1"
-                      required
-                      value={transferAmount}
-                      onChange={(e) => setTransferAmount(e.target.value)}
-                      placeholder="0.00"
-                      className="w-full rounded-xl border border-slate-300 px-4 py-3.5 font-mono text-xl font-bold text-[#072146] focus:border-[#0284FE] focus:outline-none focus:ring-2 focus:ring-[#0284FE]/20"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
-                      Motif / Référence du paiement
-                    </label>
-                    <input
-                      type="text"
-                      value={transferDescription}
-                      onChange={(e) => setTransferDescription(e.target.value)}
-                      placeholder="Ex. Règlement facture, Remboursement, Famille..."
-                      className="w-full rounded-xl border border-slate-300 px-4 py-3 text-sm focus:border-[#0284FE] focus:outline-none focus:ring-2 focus:ring-[#0284FE]/20"
-                    />
-                  </div>
+                <div className="grid sm:grid-cols-2 rounded-2xl bg-[#F4F7FB] p-1.5 mb-6 gap-1">
+                  <button
+                    type="button"
+                    onClick={() => setTransferMode('internal')}
+                    className={`rounded-xl py-3 px-3 text-xs sm:text-sm font-bold transition flex items-center justify-center gap-2 ${
+                      transferMode === 'internal'
+                        ? 'bg-[#072146] text-white shadow-sm'
+                        : 'text-slate-600 hover:text-[#072146]'
+                    }`}
+                  >
+                    <Send className="h-4 w-4 text-[#2DCCCD]" />
+                    <span>Entre Membres MONERA</span>
+                  </button>
 
                   <button
-                    type="submit"
-                    disabled={transferSubmitting}
-                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#0284FE] py-4 text-sm font-bold text-white shadow-lg shadow-blue-500/25 transition hover:bg-[#072146] disabled:opacity-60"
+                    type="button"
+                    onClick={() => setTransferMode('external')}
+                    className={`rounded-xl py-3 px-3 text-xs sm:text-sm font-bold transition flex items-center justify-center gap-2 ${
+                      transferMode === 'external'
+                        ? 'bg-[#072146] text-white shadow-sm'
+                        : 'text-slate-600 hover:text-[#072146]'
+                    }`}
                   >
-                    <Send className="h-4 w-4" />
-                    <span>
-                      {transferSubmitting
-                        ? 'Signature et exécution 3D en cours...'
-                        : 'Valider et envoyer le virement'}
-                    </span>
+                    <Building2 className="h-4 w-4 text-[#F0D384]" />
+                    <span>Autre Banque Externe</span>
                   </button>
-                </form>
+                </div>
+
+                {transferMode === 'internal' ? (
+                  <>
+                    <span className="text-xs font-bold uppercase tracking-[0.18em] text-[#0284FE]">
+                      Transfert Interne Instantané (Sans Code Requis)
+                    </span>
+                    <h2 className="mt-1 font-display text-2xl font-bold text-[#072146]">
+                      Envoyer de l’argent à un membre MONERA
+                    </h2>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Saisissez le <strong>RIB-MONERA</strong>, l’identifiant{' '}
+                      <code className="font-mono">MNR-XXXXXX</code> ou l’email du bénéficiaire pour une exécution immédiate.
+                    </p>
+
+                    <form onSubmit={handleInternalTransferSubmit} className="mt-6 space-y-5">
+                      <div>
+                        <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                          Bénéficiaire MONERA (RIB, ID ou Email)
+                        </label>
+                        <div className="relative">
+                          <Search className="h-4 w-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                          <input
+                            type="text"
+                            required
+                            value={recipientIdentifier}
+                            onChange={(e) => setRecipientIdentifier(e.target.value)}
+                            placeholder="Ex. MNR-482910 ou MNR76 00819... ou email"
+                            className="w-full rounded-xl border border-slate-300 pl-10 pr-4 py-3 text-sm font-mono focus:border-[#0284FE] focus:outline-none"
+                          />
+                        </div>
+
+                        {lookupLoading && (
+                          <p className="mt-2 text-xs text-slate-500">
+                            Vérification du compte bénéficiaire...
+                          </p>
+                        )}
+
+                        {verifiedRecipient && (
+                          <div className="mt-2.5 flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50/80 px-4 py-2.5 text-xs text-emerald-900">
+                            <span className="flex items-center gap-2 font-semibold">
+                              <UserCheck className="h-4 w-4 text-emerald-600 shrink-0" />
+                              Titulaire vérifié : <strong>{verifiedRecipient.fullName}</strong> (
+                              {verifiedRecipient.memberCode} • {verifiedRecipient.country})
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <label className="text-xs font-bold uppercase tracking-wider text-[#072146]">
+                            Montant à transférer (EUR)
+                          </label>
+                          <span className="text-xs text-slate-500">
+                            Solde :{' '}
+                            <strong className="font-mono text-[#072146]">
+                              {formatMoney(account.balance)}
+                            </strong>
+                          </span>
+                        </div>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="1"
+                          required
+                          value={transferAmount}
+                          onChange={(e) => setTransferAmount(e.target.value)}
+                          placeholder="0.00"
+                          className="w-full rounded-xl border border-slate-300 px-4 py-3.5 font-mono text-xl font-bold text-[#072146] focus:border-[#0284FE] focus:outline-none"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                          Motif du virement
+                        </label>
+                        <input
+                          type="text"
+                          value={transferDescription}
+                          onChange={(e) => setTransferDescription(e.target.value)}
+                          placeholder="Ex. Remboursement, Honoraires, Famille..."
+                          className="w-full rounded-xl border border-slate-300 px-4 py-3 text-sm focus:border-[#0284FE] focus:outline-none"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={transferSubmitting}
+                        className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#0284FE] py-4 text-sm font-bold text-white shadow-lg shadow-blue-500/25 transition hover:bg-[#072146] disabled:opacity-60"
+                      >
+                        <Send className="h-4 w-4" />
+                        <span>
+                          {transferSubmitting
+                            ? 'Exécution en cours...'
+                            : 'Envoyer instantanément au membre'}
+                        </span>
+                      </button>
+                    </form>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-xs font-bold uppercase tracking-[0.18em] text-[#0284FE]">
+                      Réseau Interbancaire Externe SEPA / International
+                    </span>
+                    <h2 className="mt-1 font-display text-2xl font-bold text-[#072146]">
+                      Envoyer vers un compte d’une autre banque
+                    </h2>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Sécurisé par double authentification : contrôle initial à <strong>15%</strong>,
+                      puis validation finale à <strong>70% → 100%</strong> via codes délivrés dans
+                      votre Messagerie d’Assistance.
+                    </p>
+
+                    <form onSubmit={handleExternalTransferSubmit} className="mt-6 space-y-4">
+                      <div className="grid sm:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                            Banque destinataire
+                          </label>
+                          <select
+                            value={selectedBankOption}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setSelectedBankOption(val);
+                              const found = EXTERNAL_BANKS.find((b) => b.name === val);
+                              if (found) setExtBic(found.bic);
+                            }}
+                            className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-3 text-sm font-semibold text-[#072146]"
+                          >
+                            {EXTERNAL_BANKS.map((b) => (
+                              <option key={b.name} value={b.name}>
+                                {b.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                            Code BIC / SWIFT
+                          </label>
+                          <input
+                            type="text"
+                            value={extBic}
+                            onChange={(e) => setExtBic(e.target.value)}
+                            placeholder="Ex. BNPAFRPP"
+                            className="w-full rounded-xl border border-slate-300 px-3.5 py-3 font-mono text-sm uppercase"
+                          />
+                        </div>
+                      </div>
+
+                      {selectedBankOption === 'Autre établissement bancaire' && (
+                        <div>
+                          <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                            Nom exact de la banque externe
+                          </label>
+                          <input
+                            type="text"
+                            required
+                            value={customBankName}
+                            onChange={(e) => setCustomBankName(e.target.value)}
+                            placeholder="Saisissez le nom complet de la banque..."
+                            className="w-full rounded-xl border border-slate-300 px-4 py-3 text-sm"
+                          />
+                        </div>
+                      )}
+
+                      <div>
+                        <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                          Nom complet du titulaire du compte externe
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={extHolderName}
+                          onChange={(e) => setExtHolderName(e.target.value)}
+                          placeholder="Ex. Claire Dubois / Société Atlas SARL"
+                          className="w-full rounded-xl border border-slate-300 px-4 py-3 text-sm"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                          IBAN / Numéro de compte bancaire externe
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={extIban}
+                          onChange={(e) => setExtIban(e.target.value)}
+                          placeholder="Ex. FR76 3000 4008 0500 0107 3829 144"
+                          className="w-full rounded-xl border border-slate-300 px-4 py-3 font-mono text-sm uppercase"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <label className="text-xs font-bold uppercase tracking-wider text-[#072146]">
+                            Montant à envoyer (EUR)
+                          </label>
+                          <span className="text-xs text-slate-500">
+                            Solde disponible :{' '}
+                            <strong className="font-mono text-[#072146]">
+                              {formatMoney(account.balance)}
+                            </strong>
+                          </span>
+                        </div>
+                        <input
+                          type="number"
+                          step="0.01"
+                          min="1"
+                          required
+                          value={extAmount}
+                          onChange={(e) => setExtAmount(e.target.value)}
+                          placeholder="0.00"
+                          className="w-full rounded-xl border border-slate-300 px-4 py-3.5 font-mono text-xl font-bold text-[#072146]"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-xs font-bold uppercase tracking-wider text-[#072146] mb-1.5">
+                          Libellé / Référence bénéficiaire
+                        </label>
+                        <input
+                          type="text"
+                          value={extDescription}
+                          onChange={(e) => setExtDescription(e.target.value)}
+                          placeholder="Ex. Virement international, Facture fournisseur..."
+                          className="w-full rounded-xl border border-slate-300 px-4 py-3 text-sm"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={transferSubmitting}
+                        className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-[#072146] py-4 text-sm font-bold text-white shadow-lg transition hover:bg-[#0284FE] disabled:opacity-60"
+                      >
+                        <Building2 className="h-4 w-4 text-[#2DCCCD]" />
+                        <span>
+                          {transferSubmitting
+                            ? 'Initialisation du routage externe...'
+                            : 'Initier le virement vers cette banque externe'}
+                        </span>
+                      </button>
+                    </form>
+                  </>
+                )}
               </div>
 
               <div className="lg:col-span-5 space-y-5">
-                <div className="rounded-3xl bg-white p-6 border border-slate-200/80">
-                  <h3 className="font-display text-base font-bold text-[#072146]">
-                    Sélection Rapide • Membres Vérifiés MONERA
-                  </h3>
-                  <p className="mt-1 text-xs text-slate-500">
-                    Cliquez sur un titulaire pour pré-remplir automatiquement son identifiant RIB-MONERA :
-                  </p>
-                  <div className="mt-4 space-y-2.5 max-h-80 overflow-y-auto pr-1">
-                    {directory.map((contact) => (
-                      <button
-                        key={contact.id}
-                        type="button"
-                        onClick={() => {
-                          setRecipientIdentifier(contact.memberCode);
-                          setVerifiedRecipient(contact);
-                        }}
-                        className="w-full text-left rounded-2xl border border-slate-200 p-3.5 transition hover:border-[#0284FE] hover:bg-[#F4F7FB] flex items-center justify-between gap-3"
-                      >
-                        <div className="min-w-0">
-                          <div className="font-display text-sm font-bold text-[#072146] truncate">
-                            {contact.fullName}
+                {transferMode === 'internal' ? (
+                  <div className="rounded-3xl bg-white p-6 border border-slate-200/80">
+                    <h3 className="font-display text-base font-bold text-[#072146]">
+                      Sélection Rapide • Membres Vérifiés MONERA
+                    </h3>
+                    <p className="mt-1 text-xs text-slate-500">
+                      Cliquez sur un membre pour remplir instantanément son identifiant :
+                    </p>
+                    <div className="mt-4 space-y-2.5 max-h-80 overflow-y-auto pr-1">
+                      {directory.map((contact) => (
+                        <button
+                          key={contact.id}
+                          type="button"
+                          onClick={() => {
+                            setRecipientIdentifier(contact.memberCode);
+                            setVerifiedRecipient(contact);
+                          }}
+                          className="w-full text-left rounded-2xl border border-slate-200 p-3.5 transition hover:border-[#0284FE] hover:bg-[#F4F7FB] flex items-center justify-between gap-3"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-display text-sm font-bold text-[#072146] truncate">
+                              {contact.fullName}
+                            </div>
+                            <div className="font-mono text-[11px] text-slate-500 truncate">
+                              {contact.memberCode} • {contact.country}
+                            </div>
                           </div>
-                          <div className="font-mono text-[11px] text-slate-500 truncate">
-                            {contact.memberCode} • {contact.country}
-                          </div>
-                        </div>
-                        <span className="rounded-lg bg-[#072146]/5 px-2.5 py-1 text-xs font-bold text-[#0284FE] shrink-0">
-                          Choisir
-                        </span>
-                      </button>
-                    ))}
+                          <span className="rounded-lg bg-[#072146]/5 px-2.5 py-1 text-xs font-bold text-[#0284FE] shrink-0">
+                            Choisir
+                          </span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
+                ) : (
+                  <div className="rounded-3xl bg-[#072146] text-white p-6 space-y-4">
+                    <div className="inline-flex items-center gap-2 rounded-full bg-white/10 px-3 py-1 text-xs font-bold text-[#2DCCCD]">
+                      <ShieldCheck className="h-4 w-4" />
+                      Protocole de Sécurité Externe en 2 Codes
+                    </div>
+                    <ol className="space-y-3 text-xs text-slate-200 leading-relaxed">
+                      <li className="rounded-xl bg-white/5 p-3">
+                        <strong className="text-[#F0D384] block">1. Palier 15% — Premier Code</strong>
+                        Dès le lancement vers une autre banque, le transfert se met en sécurité à{' '}
+                        <strong>15%</strong>. L’Administration reçoit automatiquement le 1er code et
+                        vous le transmet dans votre <strong>Messagerie d’Assistance</strong>.
+                      </li>
+                      <li className="rounded-xl bg-white/5 p-3">
+                        <strong className="text-cyan-300 block">2. Palier 70% — Second Code</strong>
+                        Après validation du 1er code, le transfert progresse jusqu’à{' '}
+                        <strong>70%</strong> et génère un second code transmis par l’Assistance.
+                      </li>
+                      <li className="rounded-xl bg-white/5 p-3">
+                        <strong className="text-emerald-300 block">
+                          3. Palier 100% — Exécution Finale
+                        </strong>
+                        La validation du second code finalise le virement à <strong>100%</strong>{' '}
+                        avec certificat holographique 3D.
+                      </li>
+                    </ol>
+                    <button
+                      type="button"
+                      onClick={() => selectTab('support')}
+                      className="w-full rounded-xl bg-[#2DCCCD] py-3 text-xs font-extrabold text-[#04142C] hover:bg-white transition"
+                    >
+                      Accéder à ma Messagerie d’Assistance →
+                    </button>
+                  </div>
+                )}
 
-                <div className="rounded-3xl bg-[#072146] text-white p-6 space-y-2.5">
-                  <div className="flex items-center gap-2 text-cyan-300 text-xs font-bold uppercase tracking-wider">
-                    <ShieldCheck className="h-4 w-4" />
+                <div className="rounded-3xl bg-white p-6 border border-slate-200/80 space-y-2">
+                  <div className="text-xs font-bold uppercase tracking-wider text-[#072146]">
                     Garantie d’Annulation Contrôlée
                   </div>
-                  <p className="text-xs text-slate-300 leading-relaxed">
-                    Vous avez effectué un transfert par erreur ? Rendez-vous dans l’onglet{' '}
-                    <strong className="text-white">Historique & Annulations</strong> et cliquez sur{' '}
-                    <strong className="text-white">Annuler le transfert</strong>. Après validation par
-                    l’Administrateur MONERA, le montant exact revient sur votre solde.
+                  <p className="text-xs text-slate-600 leading-relaxed">
+                    Tout virement peut faire l’objet d’une demande d’annulation depuis l’onglet{' '}
+                    <strong>Historique & Annulations</strong>. Après validation par l’Administrateur,
+                    le montant est recrédité sur votre solde.
                   </p>
                 </div>
               </div>
             </div>
+          )}
+
+          {activeTab === 'support' && (
+            <MemberSupportChat
+              messages={supportMessages}
+              activeExternalTransfers={activeExternalTransfers}
+              onRefresh={fetchDashboard}
+              onUseCode={() => selectTab('transfer')}
+            />
           )}
 
           {activeTab === 'history' && (
@@ -885,7 +1226,7 @@ export default function MemberDashboard() {
                     Relevé Complet des Opérations & Demandes d’Annulation
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Cliquez sur l’icône 3D pour afficher le certificat animé ou demandez la révocation d’un transfert émis.
+                    Consultez vos transferts internes et externes, reprenez un déblocage 15%/70% ou demandez une annulation.
                   </p>
                 </div>
 
@@ -894,6 +1235,7 @@ export default function MemberDashboard() {
                     { id: 'all', label: 'Toutes' },
                     { id: 'outgoing', label: 'Émises' },
                     { id: 'incoming', label: 'Reçues' },
+                    { id: 'external', label: 'Autres Banques' },
                     { id: 'cancel', label: 'Annulations' },
                   ].map((f) => (
                     <button
@@ -932,6 +1274,8 @@ export default function MemberDashboard() {
                       {filteredTransactions.map((tx) => {
                         const meta = getTxStatusMeta(tx.status);
                         const isOut = tx.direction === 'outgoing';
+                        const needsCode =
+                          tx.status === 'awaiting_code_1' || tx.status === 'awaiting_code_2';
                         return (
                           <tr key={tx.id} className="hover:bg-slate-50/70">
                             <td className="py-4 pr-4 whitespace-nowrap">
@@ -946,7 +1290,10 @@ export default function MemberDashboard() {
                               <div className="font-bold text-[#072146]">
                                 {isOut ? `Vers : ${tx.recipientName}` : `De : ${tx.senderName}`}
                               </div>
-                              <div className="text-xs text-slate-500">{tx.description}</div>
+                              <div className="text-xs text-slate-500">
+                                {tx.description}
+                                {tx.externalIban ? ` • IBAN ${tx.externalIban}` : ''}
+                              </div>
                               {tx.cancelReason && (
                                 <div className="mt-1 text-xs text-amber-700 font-medium">
                                   Motif révocation : {tx.cancelReason}
@@ -975,6 +1322,16 @@ export default function MemberDashboard() {
                               </span>
                             </td>
                             <td className="py-4 pl-4 text-right whitespace-nowrap space-x-2">
+                              {needsCode && (
+                                <button
+                                  type="button"
+                                  onClick={() => selectTab('transfer')}
+                                  className="inline-flex items-center gap-1 rounded-lg bg-[#0284FE] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#072146]"
+                                >
+                                  Entrer code ({tx.progressPercent}%)
+                                </button>
+                              )}
+
                               <button
                                 type="button"
                                 onClick={() =>
@@ -982,15 +1339,17 @@ export default function MemberDashboard() {
                                     variant:
                                       tx.status === 'cancelled'
                                         ? 'transfer_cancelled'
-                                        : tx.status === 'cancel_requested'
+                                        : tx.status === 'cancel_requested' || needsCode
                                           ? 'cancel_requested'
                                           : 'transfer_success',
                                     title:
                                       tx.status === 'cancelled'
                                         ? 'Transfert Annulé • Fonds Restitués'
-                                        : tx.status === 'cancel_requested'
-                                          ? 'Demande d’Annulation en Attente Admin'
-                                          : 'Certificat d’Opération MONERA',
+                                        : needsCode
+                                          ? `Virement Externe à ${tx.progressPercent}%`
+                                          : tx.status === 'cancel_requested'
+                                            ? 'Demande d’Annulation en Attente Admin'
+                                            : 'Certificat d’Opération MONERA',
                                     amount: tx.amount,
                                     reference: tx.reference,
                                     counterparty: isOut ? tx.recipientName : tx.senderName,
@@ -1013,7 +1372,7 @@ export default function MemberDashboard() {
                                   className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-rose-700"
                                 >
                                   <RotateCcw className="h-3.5 w-3.5" />
-                                  Annuler le transfert
+                                  Annuler
                                 </button>
                               )}
                             </td>
@@ -1460,7 +1819,7 @@ export default function MemberDashboard() {
                   onClick={() => setCancelTarget(null)}
                   className="flex-1 rounded-xl border border-slate-300 py-3 text-xs font-bold text-slate-700"
                 >
-                   Fermer
+                  Fermer
                 </button>
                 <button
                   type="submit"

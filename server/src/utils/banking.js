@@ -21,6 +21,11 @@ export function generateMoneraRib() {
   return `MNR76 ${bankCode} ${branchCode} ${accountNumber} ${key}`;
 }
 
+export function generateTransferSecurityCode(step = 1) {
+  const prefix = step === 1 ? 'MNR1' : 'MNR2';
+  return `${prefix}-${randomDigits(6)}`;
+}
+
 export function generateLuhnCardNumber(prefix = '492984') {
   const body = prefix + randomDigits(9);
   let sum = 0;

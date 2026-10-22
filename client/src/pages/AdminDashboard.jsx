@@ -3,12 +3,13 @@ import { Link } from 'react-router-dom';
 import {
   Activity,
   AlertTriangle,
-  ArrowDownLeft,
-  ArrowUpRight,
   CheckCircle2,
+  Headphones,
+  KeyRound,
   Landmark,
   LayoutDashboard,
   LogOut,
+  MessageSquare,
   MinusCircle,
   PlusCircle,
   RefreshCw,
@@ -24,6 +25,7 @@ import {
 } from 'lucide-react';
 import { apiRequest } from '../api/client';
 import BrandLogo from '../components/BrandLogo';
+import AdminSupportCenter from '../components/AdminSupportCenter';
 import { useAuth } from '../context/AuthContext';
 import {
   formatDateTime,
@@ -36,6 +38,7 @@ export default function AdminDashboard() {
   const { logout, trigger3DEvent, setSiteSettings, refreshPublicConfig } = useAuth();
 
   const [activeTab, setActiveTab] = useState('overview');
+  const [supportMemberId, setSupportMemberId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -80,13 +83,13 @@ export default function AdminDashboard() {
         apiRequest('/admin/audit-logs'),
       ]);
       setOverview(ov.kpis);
-      setSettingsForm(ov.settings);
+      setSettingsForm((prev) => prev || ov.settings);
       setMembers(mem.members || []);
       setTransactions(tx.transactions || []);
       setLoans(ln.loans || []);
       setAuditLogs(logs.logs || []);
     } catch (err) {
-      setBanner({ type: 'error', text: err.message });
+      if (!silent) setBanner({ type: 'error', text: err.message });
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -95,7 +98,37 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     loadAllBackOfficeData();
+    const timer = setInterval(() => {
+      loadAllBackOfficeData(true);
+    }, 5000);
+    return () => clearInterval(timer);
   }, [loadAllBackOfficeData]);
+
+  const handleQuickSendCodeInSupport = async (tx) => {
+    if (!tx.senderId || !tx.activeRequiredCode) return;
+    try {
+      const label =
+        tx.status === 'awaiting_code_1'
+          ? '1er code de validation interbancaire (palier 15% → 70%)'
+          : '2nd code final de compensation (palier 70% → 100%)';
+
+      await apiRequest(`/admin/messages/${tx.senderId}`, {
+        method: 'POST',
+        body: {
+          txReference: tx.reference,
+          attachedCode: tx.activeRequiredCode,
+          content: `Bonjour ${tx.senderName}, voici votre ${label} pour le virement ${tx.reference} (${formatMoney(tx.amount)} vers ${tx.externalBankName}) : ${tx.activeRequiredCode}.`,
+        },
+      });
+      await loadAllBackOfficeData(true);
+      setBanner({
+        type: 'success',
+        text: `Code ${tx.activeRequiredCode} envoyé dans la Messagerie d’Assistance de ${tx.senderName}.`,
+      });
+    } catch (err) {
+      setBanner({ type: 'error', text: err.message });
+    }
+  };
 
   const handleBalanceOperation = async (e) => {
     e.preventDefault();
@@ -228,7 +261,7 @@ export default function AdminDashboard() {
         amount: res.transaction.amount,
         reference: res.transaction.reference,
         counterparty: `${tx.senderName} → ${tx.recipientName}`,
-        detail: 'Opération confirmée définitivement sur les comptes des membres.',
+        detail: 'Opération confirmée définitivement sur les comptes.',
       });
     } catch (err) {
       setBanner({ type: 'error', text: err.message });
@@ -279,6 +312,8 @@ export default function AdminDashboard() {
       }
     } catch (err) {
       setBanner({ type: 'error', text: err.message });
+    } finally {
+      setSubmittingAction(false);
     }
   };
 
@@ -330,8 +365,12 @@ export default function AdminDashboard() {
     );
   }
 
+  const awaitingCodeCount = Number(overview?.awaitingCodeTransfers || 0);
+  const unreadSupportCount = Number(overview?.unreadSupportMessages || 0);
   const urgentTransfersCount =
-    Number(overview?.pendingTransfers || 0) + Number(overview?.cancelRequests || 0);
+    Number(overview?.pendingTransfers || 0) +
+    Number(overview?.cancelRequests || 0) +
+    awaitingCodeCount;
   const pendingLoansCount = Number(overview?.pendingLoans || 0);
 
   const filteredMembers = members.filter((m) => {
@@ -346,7 +385,19 @@ export default function AdminDashboard() {
   });
 
   const filteredTx = transactions.filter((t) => {
-    if (txFilter === 'action' && t.status !== 'cancel_requested' && t.status !== 'pending_approval') {
+    if (
+      txFilter === 'action' &&
+      !['cancel_requested', 'pending_approval', 'awaiting_code_1', 'awaiting_code_2'].includes(
+        t.status
+      )
+    ) {
+      return false;
+    }
+    if (
+      txFilter === 'codes' &&
+      t.status !== 'awaiting_code_1' &&
+      t.status !== 'awaiting_code_2'
+    ) {
       return false;
     }
     if (txFilter === 'cancel_requested' && t.status !== 'cancel_requested') return false;
@@ -366,6 +417,12 @@ export default function AdminDashboard() {
 
   const navItems = [
     { id: 'overview', label: 'Vue Exécutive', icon: LayoutDashboard },
+    {
+      id: 'support',
+      label: 'Messagerie & Codes',
+      icon: Headphones,
+      badge: unreadSupportCount + awaitingCodeCount,
+    },
     {
       id: 'transactions',
       label: 'Transferts & Annulations',
@@ -471,6 +528,15 @@ export default function AdminDashboard() {
           <div className="flex items-center gap-2.5">
             <button
               type="button"
+              onClick={() => setActiveTab('support')}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-[#F4F7FB] px-3.5 py-2 text-xs font-bold text-[#072146] hover:border-[#0284FE]"
+            >
+              <Headphones className="h-3.5 w-3.5 text-[#0284FE]" />
+              <span>Messagerie ({unreadSupportCount + awaitingCodeCount})</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => {
                 setActiveTab('members');
                 setAddMemberOpen(true);
@@ -478,7 +544,7 @@ export default function AdminDashboard() {
               className="inline-flex items-center gap-1.5 rounded-xl bg-[#072146] px-4 py-2 text-xs font-bold text-white hover:bg-[#0284FE] transition"
             >
               <UserPlus className="h-3.5 w-3.5 text-[#2DCCCD]" />
-              <span>Ajouter un membre</span>
+              <span className="hidden sm:inline">Ajouter un membre</span>
             </button>
 
             <button
@@ -522,17 +588,22 @@ export default function AdminDashboard() {
                   </div>
                 </div>
 
-                <div className="rounded-3xl bg-white p-6 border border-slate-200/80 shadow-sm">
-                  <div className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                    Volume des Transferts Validés
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('support')}
+                  className="text-left rounded-3xl bg-white p-6 border-2 border-cyan-400/70 shadow-sm hover:border-[#0284FE] transition"
+                >
+                  <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-[#0284FE]">
+                    <span>Codes Externes 15%/70% & Chat</span>
+                    <KeyRound className="h-4 w-4" />
                   </div>
-                  <div className="mt-2 font-mono text-2xl sm:text-3xl font-extrabold text-[#072146] tabular-nums">
-                    {formatMoney(overview?.completedVolume || 0)}
+                  <div className="mt-2 font-mono text-3xl font-extrabold text-[#072146] tabular-nums">
+                    {awaitingCodeCount} code(s)
                   </div>
-                  <div className="mt-2 text-xs text-slate-500">
-                    {overview?.totalTransactions || 0} écritures au grand livre
+                  <div className="mt-2 text-xs text-[#072146] font-semibold">
+                    {unreadSupportCount} message(s) client non lu(s) • Ouvrir →
                   </div>
-                </div>
+                </button>
 
                 <button
                   type="button"
@@ -543,14 +614,14 @@ export default function AdminDashboard() {
                   className="text-left rounded-3xl bg-white p-6 border-2 border-amber-300/70 shadow-sm hover:border-[#0284FE] transition"
                 >
                   <div className="flex items-center justify-between text-xs font-bold uppercase tracking-wider text-amber-700">
-                    <span>Transferts à Valider / Annuler</span>
+                    <span>Transferts à Traiter</span>
                     <AlertTriangle className="h-4 w-4" />
                   </div>
                   <div className="mt-2 font-mono text-3xl font-extrabold text-[#072146] tabular-nums">
                     {urgentTransfersCount}
                   </div>
                   <div className="mt-2 text-xs text-amber-800 font-semibold">
-                    {overview?.cancelRequests || 0} annulation(s) • {overview?.pendingTransfers || 0} en attente →
+                    {overview?.cancelRequests || 0} annulation(s) • {awaitingCodeCount} en attente code →
                   </div>
                 </button>
 
@@ -575,7 +646,7 @@ export default function AdminDashboard() {
                 <div className="lg:col-span-7 rounded-3xl bg-white p-6 border border-slate-200/80 space-y-4">
                   <div className="flex items-center justify-between">
                     <h2 className="font-display text-lg font-bold text-[#072146]">
-                      Opérations Prioritaires & Flux Récents
+                      Opérations Prioritaires, Codes 15%/70% & Flux Récents
                     </h2>
                     <button
                       type="button"
@@ -595,7 +666,7 @@ export default function AdminDashboard() {
                           className="py-3.5 flex flex-wrap items-center justify-between gap-3"
                         >
                           <div className="min-w-0">
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
                               <span className="font-mono text-xs font-bold text-[#0284FE]">
                                 {tx.reference}
                               </span>
@@ -604,6 +675,11 @@ export default function AdminDashboard() {
                               >
                                 {meta.label}
                               </span>
+                              {tx.activeRequiredCode && (
+                                <span className="rounded-md bg-[#072146] px-2 py-0.5 font-mono text-xs font-extrabold text-[#F0D384]">
+                                  Code : {tx.activeRequiredCode}
+                                </span>
+                              )}
                             </div>
                             <div className="mt-1 text-sm font-bold text-[#072146] truncate">
                               {tx.senderName} → {tx.recipientName}
@@ -615,10 +691,21 @@ export default function AdminDashboard() {
                             )}
                           </div>
 
-                          <div className="flex items-center gap-2 ml-auto">
+                          <div className="flex items-center gap-2 ml-auto flex-wrap">
                             <span className="font-mono text-sm font-extrabold text-[#072146]">
                               {formatMoney(tx.amount)}
                             </span>
+
+                            {tx.activeRequiredCode && (
+                              <button
+                                type="button"
+                                onClick={() => handleQuickSendCodeInSupport(tx)}
+                                className="rounded-lg bg-[#0284FE] px-2.5 py-1.5 text-xs font-bold text-white hover:bg-[#072146]"
+                              >
+                                Envoyer code au membre
+                              </button>
+                            )}
+
                             {(tx.status === 'pending_approval' || tx.status === 'cancel_requested') && (
                               <button
                                 type="button"
@@ -628,15 +715,17 @@ export default function AdminDashboard() {
                                 Approuver
                               </button>
                             )}
-                            {tx.type === 'transfer' && tx.status !== 'cancelled' && (
-                              <button
-                                type="button"
-                                onClick={() => handleCancelAndRefundTransfer(tx)}
-                                className="rounded-lg bg-rose-600 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-rose-700"
-                              >
-                                Annuler & Rembourser
-                              </button>
-                            )}
+
+                            {(tx.type === 'transfer' || tx.type === 'external_transfer') &&
+                              tx.status !== 'cancelled' && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleCancelAndRefundTransfer(tx)}
+                                  className="rounded-lg bg-rose-600 px-2.5 py-1.5 text-xs font-bold text-white hover:bg-rose-700"
+                                >
+                                  Annuler & Rembourser
+                                </button>
+                              )}
                           </div>
                         </div>
                       );
@@ -647,7 +736,7 @@ export default function AdminDashboard() {
                 <div className="lg:col-span-5 rounded-3xl bg-white p-6 border border-slate-200/80 space-y-4">
                   <div className="flex items-center justify-between">
                     <h2 className="font-display text-lg font-bold text-[#072146]">
-                      Accès Rapide • Créditer / Débiter Membres
+                      Accès Rapide • Créditer / Débiter / Chat
                     </h2>
                     <button
                       type="button"
@@ -670,6 +759,17 @@ export default function AdminDashboard() {
                           </div>
                         </div>
                         <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSupportMemberId(m.id);
+                              setActiveTab('support');
+                            }}
+                            title="Messagerie d'assistance"
+                            className="rounded-lg bg-slate-100 p-1.5 text-[#072146] hover:bg-[#0284FE] hover:text-white transition"
+                          >
+                            <MessageSquare className="h-3.5 w-3.5" />
+                          </button>
                           <button
                             type="button"
                             onClick={() => {
@@ -701,15 +801,22 @@ export default function AdminDashboard() {
             </>
           )}
 
+          {activeTab === 'support' && (
+            <AdminSupportCenter
+              initialMemberId={supportMemberId}
+              onGlobalRefresh={loadAllBackOfficeData}
+            />
+          )}
+
           {activeTab === 'transactions' && (
             <div className="rounded-3xl bg-white p-6 sm:p-8 border border-slate-200/80 space-y-6">
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div className="flex flex-wrap gap-1.5">
                   {[
                     { id: 'all', label: 'Tous les flux' },
-                    { id: 'action', label: `À traiter (${urgentTransfersCount})` },
+                    { id: 'codes', label: `Codes 15% / 70% (${awaitingCodeCount})` },
                     { id: 'cancel_requested', label: 'Demandes d’annulation' },
-                    { id: 'pending_approval', label: 'En attente d’approbation' },
+                    { id: 'pending_approval', label: 'En attente Admin' },
                     { id: 'completed', label: 'Effectués' },
                     { id: 'cancelled', label: 'Annulés & Remboursés' },
                   ].map((tab) => (
@@ -747,7 +854,7 @@ export default function AdminDashboard() {
                       <th className="py-3 pr-4">Référence</th>
                       <th className="py-3 px-4">Expéditeur → Bénéficiaire</th>
                       <th className="py-3 px-4">Montant</th>
-                      <th className="py-3 px-4">Statut</th>
+                      <th className="py-3 px-4">Statut & Code Actif</th>
                       <th className="py-3 pl-4 text-right">Décision Back-Office</th>
                     </tr>
                   </thead>
@@ -769,7 +876,10 @@ export default function AdminDashboard() {
                               {tx.senderName} <span className="text-[#0284FE]">→</span>{' '}
                               {tx.recipientName}
                             </div>
-                            <div className="text-xs text-slate-500">{tx.description}</div>
+                            <div className="text-xs text-slate-500">
+                              {tx.description}
+                              {tx.externalIban ? ` • IBAN ${tx.externalIban}` : ''}
+                            </div>
                             {tx.cancelReason && (
                               <div className="mt-1 inline-block rounded-lg bg-amber-50 border border-amber-200 px-2.5 py-1 text-xs font-semibold text-amber-900">
                                 Motif d’annulation du membre : {tx.cancelReason}
@@ -779,14 +889,32 @@ export default function AdminDashboard() {
                           <td className="py-4 px-4 whitespace-nowrap font-mono font-extrabold text-[#072146] tabular-nums">
                             {formatMoney(tx.amount)}
                           </td>
-                          <td className="py-4 px-4 whitespace-nowrap">
-                            <span
-                              className={`inline-flex rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${meta.badgeClass}`}
-                            >
-                              {meta.label}
-                            </span>
+                          <td className="py-4 px-4 whitespace-nowrap space-y-1">
+                            <div>
+                              <span
+                                className={`inline-flex rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${meta.badgeClass}`}
+                              >
+                                {meta.label}
+                              </span>
+                            </div>
+                            {tx.activeRequiredCode && (
+                              <div className="font-mono text-xs font-extrabold text-[#072146] bg-amber-100/80 border border-amber-300 rounded-md px-2 py-0.5 inline-block">
+                                {tx.activeRequiredCode}
+                              </div>
+                            )}
                           </td>
                           <td className="py-4 pl-4 text-right whitespace-nowrap space-x-2">
+                            {tx.activeRequiredCode && (
+                              <button
+                                type="button"
+                                onClick={() => handleQuickSendCodeInSupport(tx)}
+                                className="inline-flex items-center gap-1 rounded-lg bg-[#0284FE] px-3 py-1.5 text-xs font-bold text-white hover:bg-[#072146]"
+                              >
+                                <KeyRound className="h-3.5 w-3.5" />
+                                Envoyer code par chat
+                              </button>
+                            )}
+
                             {(tx.status === 'pending_approval' || tx.status === 'cancel_requested') && (
                               <button
                                 type="button"
@@ -800,16 +928,17 @@ export default function AdminDashboard() {
                               </button>
                             )}
 
-                            {tx.type === 'transfer' && tx.status !== 'cancelled' && (
-                              <button
-                                type="button"
-                                onClick={() => handleCancelAndRefundTransfer(tx)}
-                                className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-rose-700"
-                              >
-                                <RotateCcw className="h-3.5 w-3.5" />
-                                Valider annulation & Rembourser
-                              </button>
-                            )}
+                            {(tx.type === 'transfer' || tx.type === 'external_transfer') &&
+                              tx.status !== 'cancelled' && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleCancelAndRefundTransfer(tx)}
+                                  className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-rose-700"
+                                >
+                                  <RotateCcw className="h-3.5 w-3.5" />
+                                  Annuler & Rembourser
+                                </button>
+                              )}
                           </td>
                         </tr>
                       );
@@ -828,7 +957,7 @@ export default function AdminDashboard() {
                     Annuaire & Gestion Intégrale des Membres ({members.length})
                   </h2>
                   <p className="text-xs text-slate-500">
-                    Consultez ID, RIB-MONERA, nom, email et solde ; créditez, débitez, ajoutez ou supprimez tout compte client.
+                    Consultez ID, RIB-MONERA, nom, email et solde ; discutez par messagerie, créditez, débitez, ajoutez ou supprimez tout compte.
                   </p>
                 </div>
 
@@ -896,6 +1025,18 @@ export default function AdminDashboard() {
                           {formatMoney(m.balance)}
                         </td>
                         <td className="py-4 pl-4 text-right whitespace-nowrap space-x-1.5">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSupportMemberId(m.id);
+                              setActiveTab('support');
+                            }}
+                            className="inline-flex items-center gap-1 rounded-lg bg-[#072146] px-2.5 py-1.5 text-xs font-bold text-white hover:bg-[#0284FE]"
+                          >
+                            <MessageSquare className="h-3.5 w-3.5 text-[#2DCCCD]" />
+                            Chat
+                          </button>
+
                           <button
                             type="button"
                             onClick={() => {
@@ -1001,7 +1142,11 @@ export default function AdminDashboard() {
                           <div>
                             <strong>Revenus déclarés :</strong> {formatMoney(loan.monthlyIncome)} / mois
                           </div>
-                          {loan.details && <div><strong>Détails :</strong> {loan.details}</div>}
+                          {loan.details && (
+                            <div>
+                              <strong>Détails :</strong> {loan.details}
+                            </div>
+                          )}
                         </div>
                       </div>
 
@@ -1096,7 +1241,9 @@ export default function AdminDashboard() {
 
               <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
                 <div>
-                  <label className="block text-xs font-bold text-[#072146] mb-1">Nom de l’établissement</label>
+                  <label className="block text-xs font-bold text-[#072146] mb-1">
+                    Nom de l’établissement
+                  </label>
                   <input
                     type="text"
                     value={settingsForm.bankName}
@@ -1118,7 +1265,9 @@ export default function AdminDashboard() {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-bold text-[#072146] mb-1">Téléphone Support</label>
+                  <label className="block text-xs font-bold text-[#072146] mb-1">
+                    Téléphone Support
+                  </label>
                   <input
                     type="text"
                     value={settingsForm.supportPhone}
@@ -1145,7 +1294,7 @@ export default function AdminDashboard() {
 
                 <div>
                   <label className="block text-xs font-bold text-[#072146] mb-1">
-                    Mode de validation des virements
+                    Mode de validation des virements internes
                   </label>
                   <select
                     value={settingsForm.transferApprovalMode}
