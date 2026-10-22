@@ -1,0 +1,94 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    font-family: 'Plus Jakarta Sans Variable', 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  h1, h2, h3, h4, .font-heading {
+    font-family: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+    letter-spacing: -0.02em;
+  }
+}
+
+.perspective-1200 {
+  perspective: 1200px;
+}
+
+.preserve-3d {
+  transform-style: preserve-3d;
+}
+
+.backface-hidden {
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.rotate-y-180 {
+  transform: rotateY(180deg);
+}
+
+@keyframes orbitSpinA {
+  0% { transform: rotateX(66deg) rotateY(12deg) rotateZ(0deg); }
+  100% { transform: rotateX(66deg) rotateY(12deg) rotateZ(360deg); }
+}
+
+@keyframes orbitSpinB {
+  0% { transform: rotateX(-52deg) rotateY(38deg) rotateZ(360deg); }
+  100% { transform: rotateX(-52deg) rotateY(38deg) rotateZ(0deg); }
+}
+
+@keyframes orbitSpinC {
+  0% { transform: rotateX(24deg) rotateY(-64deg) rotateZ(0deg); }
+  100% { transform: rotateX(24deg) rotateY(-64deg) rotateZ(360deg); }
+}
+
+@keyframes holoFloat {
+  0%, 100% { transform: translateY(0px) rotateX(6deg) rotateY(-6deg); }
+  50% { transform: translateY(-10px) rotateX(-4deg) rotateY(6deg); }
+}
+
+@keyframes shimmerSweep {
+  0% { transform: translateX(-140%) skewX(-22deg); }
+  100% { transform: translateX(240%) skewX(-22deg); }
+}
+
+.orbit-ring-a {
+  animation: orbitSpinA 7s linear infinite;
+}
+
+.orbit-ring-b {
+  animation: orbitSpinB 9.5s linear infinite;
+}
+
+.orbit-ring-c {
+  animation: orbitSpinC 12s linear infinite;
+}
+
+.holo-float {
+  animation: holoFloat 4.8s ease-in-out infinite;
+}
+
+.shimmer-sweep::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 55%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.08) 45%,
+    rgba(45, 204, 205, 0.22) 50%,
+    rgba(255, 255, 255, 0.08) 55%,
+    transparent 100%
+  );
+  animation: shimmerSweep 5.5s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
